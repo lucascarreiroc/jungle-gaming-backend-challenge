@@ -140,6 +140,13 @@ export class PostgresWalletRepository implements WalletRepository {
 }
 
 export class PostgresWagerTransactionRepository implements WagerTransactionRepository {
+  async findById(id: string, tx: unknown): Promise<WagerTransaction | null> {
+    const client = asClient(tx);
+    const res = await client.query(`SELECT * FROM wager_transactions WHERE id = $1`, [id]);
+    if (res.rowCount === 0) return null;
+    return this.toDomain(res.rows[0]);
+  }
+
   async findByIdempotencyKey(
     providerId: string,
     idempotencyKey: string,
@@ -189,8 +196,9 @@ export class PostgresWagerTransactionRepository implements WagerTransactionRepos
         id, provider_id, external_transaction_id, idempotency_key, payload_hash,
         wallet_id, player_id, round_id, game_id, kind,
         money_amount, money_currency, reference_external_transaction_id,
-        reference_transaction_id, status, failure_code, created_at, processed_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+        reference_transaction_id, status, failure_code, created_at, processed_at,
+        reference_check_attempts
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
       [
         t.id,
         t.providerId,
@@ -210,6 +218,7 @@ export class PostgresWagerTransactionRepository implements WagerTransactionRepos
         t.failureCode ?? null,
         t.createdAt,
         t.processedAt ?? null,
+        t.referenceCheckAttempts,
       ],
     );
   }
@@ -218,9 +227,17 @@ export class PostgresWagerTransactionRepository implements WagerTransactionRepos
     const client = asClient(tx);
     await client.query(
       `UPDATE wager_transactions
-       SET status = $1, failure_code = $2, reference_transaction_id = $3, processed_at = $4
-       WHERE id = $5`,
-      [t.status, t.failureCode ?? null, t.referenceTransactionId ?? null, t.processedAt ?? null, t.id],
+       SET status = $1, failure_code = $2, reference_transaction_id = $3, processed_at = $4,
+           reference_check_attempts = $5
+       WHERE id = $6`,
+      [
+        t.status,
+        t.failureCode ?? null,
+        t.referenceTransactionId ?? null,
+        t.processedAt ?? null,
+        t.referenceCheckAttempts,
+        t.id,
+      ],
     );
   }
 
@@ -243,6 +260,7 @@ export class PostgresWagerTransactionRepository implements WagerTransactionRepos
       referenceTransactionId: row.reference_transaction_id ?? undefined,
       failureCode: (row.failure_code as FailureCode) ?? undefined,
       processedAt: row.processed_at ?? undefined,
+      referenceCheckAttempts: row.reference_check_attempts ?? 0,
     });
   }
 }

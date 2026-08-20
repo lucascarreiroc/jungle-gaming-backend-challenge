@@ -14,7 +14,7 @@ import {
   SystemClock,
   UuidGenerator,
 } from '../../src/infrastructure/db/postgres-repositories';
-import { SubmitWagerTransactionUseCase } from '../../src/application/use-cases/submit-wager-transaction.use-case';
+import { SubmitWagerTransactionUseCase, SubmitWagerTransactionInput, SubmitWagerTransactionOutput } from '../../src/application/use-cases/submit-wager-transaction.use-case';
 
 /**
  * Contexto de teste que conecta no Postgres REAL rodando via docker-compose.
@@ -98,11 +98,41 @@ export function createTestContext() {
     return uow.run((tx) => ledger.listByWallet(walletId, undefined, 1000, tx));
   }
 
+  /** Wrapper fino sobre useCase.execute, com defaults sensatos para testes. */
+  async function submit(
+    overrides: Partial<SubmitWagerTransactionInput> &
+      Pick<SubmitWagerTransactionInput, 'walletId' | 'playerId' | 'kind' | 'money'>,
+  ): Promise<SubmitWagerTransactionOutput> {
+    const externalId = overrides.externalTransactionId ?? `tx-${randomUUID()}`;
+    return useCase.execute({
+      providerId: 'provider-a',
+      externalTransactionId: externalId,
+      idempotencyKey: `provider-a:${externalId}`,
+      roundId: 'round-x',
+      gameId: 'fortune-chimp',
+      ...overrides,
+    });
+  }
+
   async function close() {
     await pool.end();
   }
 
-  return { pool, uow, wallets, transactions, ledger, useCase, createFundedWallet, getWallet, getLedgerEntries, close };
+  return {
+    pool,
+    uow,
+    wallets,
+    transactions,
+    ledger,
+    outbox,
+    clock,
+    useCase,
+    createFundedWallet,
+    getWallet,
+    getLedgerEntries,
+    submit,
+    close,
+  };
 }
 
 export type TestContext = ReturnType<typeof createTestContext>;

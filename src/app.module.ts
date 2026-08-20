@@ -3,6 +3,7 @@ import { Pool } from 'pg';
 import { WalletsController } from './interfaces/http/wallets.controller';
 import { WageringController } from './interfaces/http/wagering.controller';
 import { HealthController } from './interfaces/http/health.controller';
+import { MetricsController } from './interfaces/http/metrics.controller';
 import {
   PostgresUnitOfWork,
   PostgresWalletRepository,
@@ -17,7 +18,7 @@ import { SubmitWagerTransactionUseCase } from './application/use-cases/submit-wa
 import { TOKENS } from './tokens';
 
 @Module({
-  controllers: [WalletsController, WageringController, HealthController],
+  controllers: [WalletsController, WageringController, HealthController, MetricsController],
   providers: [
     {
       provide: TOKENS.PG_POOL,

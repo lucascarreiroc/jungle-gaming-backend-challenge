@@ -1,4 +1,6 @@
 import type { UnitOfWork, OutboxRepository, EventPublisher, Clock } from '../ports';
+import { recordOutboxRetry, recordOutboxLagMs } from '../../infrastructure/observability/metrics';
+import { logEvent } from '../../infrastructure/observability/logger';
 
 /**
  * Publica mensagens pendentes da outbox. Seguro para rodar em múltiplas
@@ -42,9 +44,18 @@ export class OutboxPublisherWorker {
       try {
         await this.publisher.publish(this.destination, message.payload);
         message.markPublished(this.clock.now());
+        recordOutboxLagMs(this.clock.now().getTime() - message.occurredAt.getTime());
         published += 1;
       } catch (err) {
         message.scheduleRetry(this.clock.now());
+        recordOutboxRetry();
+        logEvent('warn', 'outbox message publish failed, scheduled retry', {
+          outboxMessageId: message.id,
+          aggregateId: message.aggregateId,
+          eventType: message.eventType,
+          attempts: message.attempts,
+          error: err instanceof Error ? err.message : String(err),
+        });
         failed += 1;
       }
       // Confirmação em transação própria e curta.

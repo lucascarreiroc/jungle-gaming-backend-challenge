@@ -10,6 +10,8 @@ import type { InboxRepository, UnitOfWork } from '../../application/ports';
 import { InboxMessage } from '../../domain/inbox-outbox';
 import { DomainError } from '../../domain/errors';
 import { WagerTransactionKind } from '../../domain/wager-transaction';
+import { recordSqsRedelivery } from '../observability/metrics';
+import { logEvent } from '../observability/logger';
 
 const CONSUMER_NAME = 'wager-transactions-consumer';
 
@@ -230,8 +232,13 @@ export class SqsConsumer {
       // (Postgres fora do ar, timeout de rede, etc.) — NÃO fazemos ack.
       // A mensagem volta a ficar visível após o visibility timeout e é
       // reentregue automaticamente pelo SQS.
-      // eslint-disable-next-line no-console
-      console.error('[SqsConsumer] transient error, message will be redelivered:', err);
+      recordSqsRedelivery();
+      logEvent('error', 'sqs message processing failed transiently, will be redelivered', {
+        messageId,
+        providerId: envelope.data?.providerId,
+        walletId: envelope.data?.walletId,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 

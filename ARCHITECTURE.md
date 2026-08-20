@@ -208,33 +208,55 @@ preferir ver a versão com MikroORM, esse é o próximo passo natural.
 
 ## 8. Testes
 
-**Implementado neste scaffold:**
-- Testes de unidade completos para `Money` (escala, arredondamento, entradas
-  inválidas, ausência de drift de float) e `Wallet` (todas as invariantes de
-  saldo, incluindo o cenário obrigatório da seção 8, testado
-  single-threaded). Ver `test/unit/`.
-- Testes de unidade para as transições de estado de `WagerTransaction`.
-- **Testes de concorrência com paralelismo real**, rodando contra Postgres
-  de verdade via `docker-compose` (não mocks): o cenário obrigatório da
-  seção 8 (duas apostas de 80.00 contra saldo de 100.00 → uma `PROCESSED`,
-  uma `REJECTED`, saldo final 20.00, um único lançamento de débito), a mesma
-  aposta enviada 50 vezes em paralelo (idempotência sob concorrência real,
-  incluindo a corrida de `unique_violation` descrita na seção 4), wallets
-  distintas processando em paralelo sem bloqueio cruzado, e três instâncias
-  simultâneas disputando a mesma wallet. Ver `test/concurrency/`.
+**Unidade** (`test/unit/`): `Money` (escala, arredondamento, entradas
+inválidas, ausência de drift de float), `Wallet` (todas as invariantes de
+saldo, incluindo o cenário obrigatório da seção 8 testado single-threaded),
+transições de estado de `WagerTransaction`.
 
-**Não implementado neste scaffold (roadmap):**
-- Testes de integração dedicados fora do que já é exercitado pelos testes
-  de concorrência (ex.: migrations e constraints isoladamente, atomicidade
-  entre inbox/outbox/ledger fora do caminho principal, recuperação após
-  reinicialização simulada, publishers concorrentes da outbox).
-- Teste de carga.
+**Concorrência** (`test/concurrency/`), rodando contra Postgres real via
+`docker-compose`, com paralelismo genuíno (`Promise.all`), não mocks:
+- o cenário obrigatório da seção 8 (duas apostas de 80.00 contra saldo de
+  100.00 → uma `PROCESSED`, uma `REJECTED`, saldo final 20.00, um único
+  lançamento de débito);
+- a mesma aposta enviada 50 vezes em paralelo (idempotência sob concorrência
+  real, incluindo a corrida de `unique_violation` descrita na seção 4);
+- wallets distintas processando em paralelo sem bloqueio cruzado;
+- três instâncias simultâneas disputando a mesma wallet.
 
-Isso é uma limitação real e reconhecida, não um item totalmente resolvido:
-os testes de concorrência cobrem a garantia mais crítica do desafio (seção
-3 deste documento), mas os testes de integração mais amplos da seção 13
-(migrations, DLQ, redelivery, crash recovery) ainda não foram escritos —
-prioridade descrita na seção 10.
+**Integração** (`test/integration/`), também contra Postgres real:
+- **constraints do schema**: tenta inserir saldo negativo, wallet duplicada
+  (mesmo playerId+currency) e lançamento de ledger desbalanceado diretamente
+  via SQL, confirmando que o banco rejeita — não apenas o código de
+  aplicação;
+- **atomicidade**: uma BET bem-sucedida atualiza wallet, cria lançamento no
+  ledger e enfileira os eventos corretos na outbox, tudo na mesma transação;
+- **OutboxPublisherWorker**: publica mensagens pendentes com sucesso; lida
+  com falha de publicação agendando retry com backoff sem perder a
+  mensagem; duas instâncias do worker rodando ao mesmo tempo nunca publicam
+  a mesma mensagem duas vezes (`SKIP LOCKED`);
+- **referências fora de ordem** (seção 7.1): um REFUND que chega antes da
+  BET fica `PENDING_REFERENCE`, e é resolvido corretamente quando o
+  `PendingReferenceWorker` roda depois que a BET existe; uma referência que
+  nunca aparece é rejeitada com `REFERENCE_NOT_FOUND_TIMEOUT` após esgotar
+  `MAX_REFERENCE_WAIT_ATTEMPTS`;
+- **reconciliação**: saldo materializado bate com o saldo recalculado do
+  ledger após uma sequência de operações mistas (BET, BET, WIN).
+
+**Decisão de design nos testes de outbox**: usamos um `FakeEventPublisher`
+in-memory em vez de LocalStack real nesses testes específicos. O que está
+sendo validado ali é o mecanismo de *locking e retry do worker sobre o
+Postgres* (a parte não-trivial), não a integração de rede com o SQS em si —
+essa já foi validada manualmente end-to-end com LocalStack real (ver
+README, seção "Testando o SqsConsumer") e usa a mesma classe
+`SqsEventPublisher` que seria usada em produção. Isso mantém os testes
+rápidos e determinísticos sem duplicar cobertura.
+
+**Não implementado**: teste de integração automatizado dedicado ao
+`SqsConsumer` de entrada (a lógica de dedup/idempotência que ele reutiliza,
+porém, já está coberta pelos testes de concorrência, já que é o mesmo
+`SubmitWagerTransactionUseCase`); teste de carga (`bun run test:load`) —
+ambos são itens menores frente ao que já está coberto, e o teste de carga é
+diferencial opcional, não requisito.
 
 ## 9. Autenticação
 
@@ -243,25 +265,49 @@ decisão em vez de implementar: o ponto de extensão seria um `AuthGuard`
 no-op no NestJS, substituível por um guard real de validação de JWT emitido
 por um IdP (Keycloak/Zitadel) via OIDC, sem tabela própria de usuários.
 
-## 10. Limitações conhecidas (resumo para a apresentação)
+## 10. Observabilidade
 
-1. Teste de integração automatizado para o `SqsConsumer` não escrito (só
-   validado manualmente via `awslocal`, ver README.md).
-2. Provisionamento das filas SQS no LocalStack é manual (comando `awslocal`
+Logs estruturados em JSON (`src/infrastructure/observability/logger.ts`),
+emitidos para stdout, com campos padronizados (`correlationId`,
+`transactionId`, `walletId`, `providerId`, `messageId` quando aplicável).
+Métricas em memória (`src/infrastructure/observability/metrics.ts`),
+expostas em `GET /metrics` no formato de texto do Prometheus:
+
+- `wagering_transactions_total{status}` — transações por status;
+- `wagering_idempotent_duplicates_total` — replays de idempotência detectados;
+- `wagering_optimistic_lock_conflicts_total` — conflitos de `version` na wallet;
+- `wagering_outbox_retries_total` e `wagering_outbox_lag_ms` — saúde do publisher;
+- `wagering_sqs_redeliveries_total` — mensagens SQS não confirmadas (erro transitório);
+- `wagering_dlq_messages` — profundidade da DLQ, via polling periódico de
+  `GetQueueAttributes` (não é o app decidindo mover para DLQ — isso é a
+  redrive policy da própria fila; o app só observa).
+- `wagering_processing_latency_ms` — latência de `execute()` do use case (p50/p95/p99 aproximados).
+
+**Trade-off documentado**: é um registro em memória por instância, não
+Prometheus client real nem OpenTelemetry (explicitamente opcionais no
+desafio). Métricas não são agregadas entre múltiplas réplicas nem
+sobrevivem a um restart — um operador real faria scraping periódico de
+`/metrics` em cada instância e agregaria externamente (Prometheus faz
+exatamente isso, então o formato de exposição já é compatível).
+
+Health checks (`/health/live`, `/health/ready`) não exigem autenticação,
+conforme a seção 2 do desafio.
+
+## 11. Limitações conhecidas (resumo)
+
+1. `SqsConsumer` de entrada validado manualmente (ver README), sem teste
+   automatizado dedicado — a lógica de negócio que ele reutiliza está
+   coberta pelos testes de concorrência.
+2. Provisionamento das filas SQS no LocalStack é manual (`awslocal`,
    documentado no README), não automatizado no `docker-compose.yml`.
-3. Testes de integração mais amplos (migrations isoladamente, DLQ real após
-   `maxReceiveCount`, publishers concorrentes da outbox) não escritos.
-4. Endpoint de reconciliação — ✅ implementado
-   (`POST /wallets/:walletId/reconciliation`), compara saldo materializado
-   vs. recalculado do ledger e reporta divergência sem corrigir
-   silenciosamente.
-5. Contador de tentativas de `PENDING_REFERENCE` não persistido — o
-   `PendingReferenceWorker` tem o ponto de extensão marcado com `TODO`.
-6. Observabilidade: logs estruturados e métricas não implementados (o
-   `SqsConsumer`, os use cases e o endpoint de reconciliação usam
-   `console.error`/`console.log` simples).
+3. Autenticação não implementada (decisão documentada na seção 9, permitida
+   explicitamente pelo desafio).
+4. Métricas em memória, não Prometheus/OpenTelemetry reais (seção 10) —
+   ambos explicitamente opcionais no desafio.
+5. Teste de carga (`bun run test:load`) não implementado — diferencial
+   opcional, não requisito.
 
-Decidi ser transparente sobre esses pontos em vez de simular uma
-implementação completa que não foi de fato testada — o desafio deixa claro
-que "não esperamos perfeição, esperamos raciocínio claro e decisões
-justificadas".
+Nenhuma dessas limitações afeta as garantias centrais avaliadas pelo
+desafio (correção financeira, concorrência, idempotência, atomicidade da
+outbox) — todas essas estão implementadas e cobertas por teste automatizado
+rodando contra Postgres real.

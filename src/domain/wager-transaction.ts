@@ -63,6 +63,7 @@ export interface WagerTransactionState {
   referenceTransactionId?: string;
   failureCode?: FailureCode;
   processedAt?: Date;
+  referenceCheckAttempts?: number;
 }
 
 /**
@@ -93,6 +94,7 @@ export class WagerTransaction {
     private _referenceTransactionId?: string,
     private _failureCode?: FailureCode,
     private _processedAt?: Date,
+    private _referenceCheckAttempts: number = 0,
   ) {}
 
   /** Nasce em PENDING. Valida a exigência de referência por kind. */
@@ -169,6 +171,7 @@ export class WagerTransaction {
       state.referenceTransactionId,
       state.failureCode,
       state.processedAt,
+      state.referenceCheckAttempts ?? 0,
     );
   }
 
@@ -186,6 +189,20 @@ export class WagerTransaction {
 
   get processedAt(): Date | undefined {
     return this._processedAt;
+  }
+
+  get referenceCheckAttempts(): number {
+    return this._referenceCheckAttempts;
+  }
+
+  /**
+   * Incrementa o contador de tentativas de resolução de referência (usado
+   * pelo PendingReferenceWorker). Não é uma transição de status — pode ser
+   * chamado enquanto a transação estiver em PENDING_REFERENCE, sem afetar
+   * o campo `status`.
+   */
+  incrementReferenceCheckAttempts(): void {
+    this._referenceCheckAttempts += 1;
   }
 
   // ---- transições ----

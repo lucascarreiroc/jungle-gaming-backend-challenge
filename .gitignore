@@ -1,9 +1,13 @@
-﻿node_modules/
+node_modules/
 dist/
 *.log
 .env
 .env.local
+
+# Arquivos de teste manual criados durante o desenvolvimento local
 message.json
 test-connection.js
+
+# Editores
 .vscode/
 .idea/

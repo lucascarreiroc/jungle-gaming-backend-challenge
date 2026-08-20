@@ -29,6 +29,7 @@ export interface WalletRepository {
 }
 
 export interface WagerTransactionRepository {
+  findById(id: string, tx: unknown): Promise<WagerTransaction | null>;
   findByIdempotencyKey(providerId: string, idempotencyKey: string, tx: unknown): Promise<WagerTransaction | null>;
   findByExternalId(providerId: string, externalTransactionId: string, tx: unknown): Promise<WagerTransaction | null>;
   findPendingReferenceBatch(limit: number, tx: unknown): Promise<WagerTransaction[]>;

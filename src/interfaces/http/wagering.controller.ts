@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Headers, HttpException, HttpStatus, Param, Post } from '@nestjs/common';
+import { Body, Controller, Get, Headers, HttpException, HttpStatus, Inject, Param, Post } from '@nestjs/common';
 import {
   SubmitWagerTransactionUseCase,
   IdempotencyConflictError,
@@ -6,6 +6,8 @@ import {
 } from '../../application/use-cases/submit-wager-transaction.use-case';
 import { WagerTransactionKind } from '../../domain/wager-transaction';
 import { DomainError } from '../../domain/errors';
+import type { WagerTransactionRepository, UnitOfWork } from '../../application/ports';
+import { TOKENS } from '../../tokens';
 
 interface SubmitTransactionBody {
   providerId: string;
@@ -29,11 +31,15 @@ interface SubmitTransactionBody {
  *        não tentar "corrigir" algo que já estava sintaticamente correto.
  * - 503: falha transitória de infraestrutura (INFRA_*) — o provedor deve reenviar.
  */
-@Controller('wagering/transactions')
+@Controller()
 export class WageringController {
-  constructor(private readonly submitWagerTransaction: SubmitWagerTransactionUseCase) {}
+  constructor(
+    private readonly submitWagerTransaction: SubmitWagerTransactionUseCase,
+    @Inject(TOKENS.WAGER_TRANSACTION_REPOSITORY) private readonly transactions: WagerTransactionRepository,
+    @Inject(TOKENS.UNIT_OF_WORK) private readonly uow: UnitOfWork,
+  ) {}
 
-  @Post()
+  @Post('wagering/transactions')
   async submit(
     @Headers('idempotency-key') idempotencyKey: string,
     @Body() body: SubmitTransactionBody,
@@ -80,11 +86,46 @@ export class WageringController {
     }
   }
 
-  @Get(':transactionId')
-  async getById(@Param('transactionId') _transactionId: string) {
-    // TODO: injetar WagerTransactionRepository e implementar a consulta.
-    // Omitido aqui para focar o tempo nas áreas de maior peso na avaliação
-    // (correção financeira, concorrência, idempotência) — ver README.md.
-    throw new HttpException('Not implemented', HttpStatus.NOT_IMPLEMENTED);
+  @Get('wagering/transactions/:transactionId')
+  async getById(@Param('transactionId') transactionId: string) {
+    const transaction = await this.uow.run((tx) => this.transactions.findById(transactionId, tx));
+    if (!transaction) {
+      throw new HttpException('Transaction not found', HttpStatus.NOT_FOUND);
+    }
+    return this.toResponse(transaction);
+  }
+
+  @Get('providers/:providerId/wagering/transactions/:externalTransactionId')
+  async getByProviderAndExternalId(
+    @Param('providerId') providerId: string,
+    @Param('externalTransactionId') externalTransactionId: string,
+  ) {
+    const transaction = await this.uow.run((tx) =>
+      this.transactions.findByExternalId(providerId, externalTransactionId, tx),
+    );
+    if (!transaction) {
+      throw new HttpException('Transaction not found', HttpStatus.NOT_FOUND);
+    }
+    return this.toResponse(transaction);
+  }
+
+  private toResponse(transaction: Awaited<ReturnType<WagerTransactionRepository['findById']>>) {
+    if (!transaction) return null;
+    return {
+      transactionId: transaction.id,
+      providerId: transaction.providerId,
+      externalTransactionId: transaction.externalTransactionId,
+      walletId: transaction.walletId,
+      playerId: transaction.playerId,
+      roundId: transaction.roundId,
+      gameId: transaction.gameId,
+      kind: transaction.kind,
+      money: transaction.money.toJSON(),
+      status: transaction.status,
+      referenceExternalTransactionId: transaction.referenceExternalTransactionId ?? null,
+      failureCode: transaction.failureCode ?? null,
+      createdAt: transaction.createdAt,
+      processedAt: transaction.processedAt ?? null,
+    };
   }
 }
