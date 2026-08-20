@@ -16,15 +16,6 @@ import {
 } from '../../src/infrastructure/db/postgres-repositories';
 import { SubmitWagerTransactionUseCase, SubmitWagerTransactionInput, SubmitWagerTransactionOutput } from '../../src/application/use-cases/submit-wager-transaction.use-case';
 
-/**
- * Contexto de teste que conecta no Postgres REAL rodando via docker-compose.
- * Requer DATABASE_URL setado (ver README.md) e as tabelas já migradas.
- *
- * Deliberadamente não usamos mocks aqui: o requisito de "paralelismo real,
- * não mocks sequenciais" (seção 13 do desafio) só é comprovado testando
- * contra o Postgres de verdade, com Promise.all disparando múltiplas
- * conexões simultâneas do pool.
- */
 export function createTestContext() {
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) {
@@ -33,10 +24,6 @@ export function createTestContext() {
     );
   }
 
-  // Pool com mais de uma conexão é essencial aqui: com poolSize=1 todas as
-  // "requisições concorrentes" ficariam artificialmente serializadas pelo
-  // próprio pool, mascarando exatamente a condição de corrida que queremos
-  // testar.
   const pool = new Pool({ connectionString, max: 20 });
 
   const uow = new PostgresUnitOfWork(pool);
@@ -49,7 +36,6 @@ export function createTestContext() {
 
   const useCase = new SubmitWagerTransactionUseCase(uow, wallets, transactions, ledger, outbox, clock, ids);
 
-  /** Cria uma wallet já fundada, direto via domínio + repositórios (sem passar pelo HTTP). */
   async function createFundedWallet(initialAmount: string, currency = 'BRL') {
     const playerId = randomUUID();
     return uow.run(async (tx) => {
@@ -98,7 +84,6 @@ export function createTestContext() {
     return uow.run((tx) => ledger.listByWallet(walletId, undefined, 1000, tx));
   }
 
-  /** Wrapper fino sobre useCase.execute, com defaults sensatos para testes. */
   async function submit(
     overrides: Partial<SubmitWagerTransactionInput> &
       Pick<SubmitWagerTransactionInput, 'walletId' | 'playerId' | 'kind' | 'money'>,

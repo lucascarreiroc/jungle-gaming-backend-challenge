@@ -25,12 +25,6 @@ export interface LedgerEntryState {
   createdAt: Date;
 }
 
-/**
- * WalletLedgerEntry é estruturalmente imutável: sem setters, sem métodos de
- * transição. `create()` valida a aritmética do lançamento na fronteira —
- * balanceBefore ± money deve ser exatamente balanceAfter, ou o lançamento
- * nunca chega a existir.
- */
 export class WalletLedgerEntry {
   private constructor(
     public readonly id: string,
@@ -75,7 +69,6 @@ export class WalletLedgerEntry {
     );
   }
 
-  /** balanceBefore ± money === balanceAfter. */
   isBalanced(): boolean {
     const expected =
       this.direction === LedgerDirection.Credit

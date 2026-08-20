@@ -23,19 +23,6 @@ import type {
   IdGenerator,
 } from '../../application/ports';
 
-/**
- * Nota de design (ver ARCHITECTURE.md, seção "ORM"):
- * O desafio recomenda MikroORM como opção preferencial. Optamos por acessar
- * o Postgres diretamente via `pg` nesta camada porque a operação mais crítica
- * do sistema — o UPDATE otimista da wallet — precisa de controle explícito
- * sobre a cláusula WHERE version = ? e sobre o número de linhas afetadas, e
- * isso fica mais direto de auditar em SQL puro do que atrás de abstrações de
- * um ORM. Um EntityManager.transactional() do MikroORM encapsularia o mesmo
- * client/transação por baixo; a troca é mecânica, não estrutural — os
- * repositórios abaixo já seguem o contrato de portas (`ports.ts`) para que
- * essa troca seja possível sem tocar nos use cases.
- */
-
 export class PostgresUnitOfWork implements UnitOfWork {
   constructor(private readonly pool: Pool) {}
 
@@ -294,7 +281,6 @@ export class PostgresLedgerRepository implements LedgerRepository {
     tx: unknown,
   ): Promise<WalletLedgerEntry[]> {
     const client = asClient(tx);
-    // Cursor opaco: base64 de `${created_at.toISOString()}|${id}` para paginação estável.
     let cursorClause = '';
     const params: unknown[] = [walletId];
     if (cursor) {
@@ -358,9 +344,6 @@ export class PostgresInboxRepository implements InboxRepository {
 
   async insert(message: InboxMessage, tx: unknown): Promise<void> {
     const client = asClient(tx);
-    // ON CONFLICT DO NOTHING: se duas instâncias tentarem inserir a mesma
-    // (consumer_name, message_id) simultaneamente, a PK composta garante que
-    // só uma vence — a outra deve reconsultar e tratar como já processada.
     await client.query(
       `INSERT INTO inbox_messages (message_id, consumer_name, payload_hash, received_at, processed_at)
        VALUES ($1,$2,$3,$4,$5)

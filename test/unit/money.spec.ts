@@ -59,7 +59,7 @@ describe('Money', () => {
     const a = Money.from({ amount: '10.00', currency: 'BRL' });
     const b = Money.from({ amount: '5.00', currency: 'BRL' });
     const result = a.add(b);
-    expect(a.toJSON().amount).toBe('10.00'); // a unchanged
+    expect(a.toJSON().amount).toBe('10.00');
     expect(result.toJSON().amount).toBe('15.00');
   });
 
@@ -81,7 +81,7 @@ describe('Money', () => {
     const a = Money.from({ amount: '10.00', currency: 'BRL' });
     const negated = a.negate();
     expect(negated.isNegative()).toBe(true);
-    expect(a.isPositive()).toBe(true); // original unchanged
+    expect(a.isPositive()).toBe(true);
   });
 
   it('isLessThan compares magnitudes correctly', () => {
@@ -97,7 +97,6 @@ describe('Money', () => {
     for (let i = 0; i < 1000; i++) {
       total = total.add(cent);
     }
-    // 1000 * 0.01 = 10.00 exactly - with IEEE754 float this often drifts.
     expect(total.toJSON().amount).toBe('10.00');
   });
 });

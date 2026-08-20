@@ -1,9 +1,3 @@
-/**
- * Tokens de DI do NestJS. Interfaces TypeScript não existem em tempo de
- * execução, então o Nest não consegue resolver `constructor(x: WalletRepository)`
- * automaticamente por reflexão — precisamos de tokens string/symbol explícitos
- * usados tanto no @Inject() do consumidor quanto no `provide` do módulo.
- */
 export const TOKENS = {
   PG_POOL: 'PG_POOL',
   UNIT_OF_WORK: 'UNIT_OF_WORK',

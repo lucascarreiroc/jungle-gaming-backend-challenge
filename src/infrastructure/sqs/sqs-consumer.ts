@@ -15,9 +15,6 @@ import { logEvent } from '../observability/logger';
 
 const CONSUMER_NAME = 'wager-transactions-consumer';
 
-/**
- * Formato esperado da mensagem publicada na fila (ver seção 10 do desafio).
- */
 interface WagerTransactionMessageEnvelope {
   messageId: string;
   type: string;
@@ -39,47 +36,12 @@ interface WagerTransactionMessageEnvelope {
 export interface SqsConsumerConfig {
   queueUrl: string;
   region: string;
-  endpoint?: string; // usado para apontar para o LocalStack
-  maxMessages?: number; // até 10, limite da API SQS
-  waitTimeSeconds?: number; // long polling
+  endpoint?: string;
+  maxMessages?: number;
+  waitTimeSeconds?: number;
   visibilityTimeoutSeconds?: number;
 }
 
-/**
- * Consumer da fila `wager-transactions.fifo` (ver seção 10 do desafio).
- *
- * Responsabilidades cobertas aqui:
- * - Reutiliza o MESMO `SubmitWagerTransactionUseCase` da entrada HTTP —
- *   não existe uma segunda cópia da lógica de negócio para o caminho SQS.
- * - Deduplica via inbox persistente por (consumerName, messageId), ANTES de
- *   chamar o use case — evita reprocessar efeitos de negócio para uma
- *   mensagem redelivered que já foi tratada.
- * - Faz ack (DeleteMessage) somente depois que o use case retorna com
- *   sucesso (ou com uma rejeição de negócio, que também é terminal e não
- *   deve ser retentada).
- * - Distingue três classes de erro:
- *     · erro de negócio (o use case responde REJECTED de forma controlada)
- *       -> ack, não é reenviado, o resultado fica registrado no nosso banco;
- *     · erro transitório de infraestrutura (ex.: Postgres momentaneamente
- *       fora do ar) -> NÃO faz ack; a mensagem volta a ficar visível após o
- *       visibility timeout expirar e o SQS reentrega automaticamente;
- *     · erro permanente inesperado (bug, payload corrompido que nem chega a
- *       ser um DomainError) -> loga e não faz ack; após esgotar
- *       `maxReceiveCount` (configurado na fila, fora do código da
- *       aplicação — ver ARCHITECTURE.md), o SQS move a mensagem para a DLQ
- *       automaticamente.
- * - Em SIGTERM: para de puxar mensagens novas e espera as mensagens em
- *   andamento terminarem antes de finalizar o processo, em vez de
- *   simplesmente derrubar o processo com trabalho pela metade.
- *
- * Nota de escopo (ver ARCHITECTURE.md): a marcação do InboxMessage como
- * "processado" acontece em uma transação separada da mutação financeira do
- * use case (que já commita sua própria transação internamente). Isso NÃO
- * compromete a correção: a garantia final contra duplicação continua sendo
- * a constraint UNIQUE(provider_id, idempotency_key) no nível de negócio —
- * o Inbox aqui é uma otimização para não nem chamar o use case de novo para
- * uma mensagem obviamente repetida, não a fonte da verdade de idempotência.
- */
 export class SqsConsumer {
   private readonly client: SQSClient;
   private running = false;
@@ -98,7 +60,6 @@ export class SqsConsumer {
     });
   }
 
-  /** Inicia o loop de polling. Roda até stop() ser chamado. */
   async start(): Promise<void> {
     this.running = true;
     this.stopRequested = false;
@@ -108,9 +69,6 @@ export class SqsConsumer {
         const messages = await this.receiveBatch();
         for (const message of messages) {
           if (this.stopRequested) {
-            // Não inicia processamento de mensagens novas após o pedido de
-            // parada — a visibilidade delas expira naturalmente e o SQS as
-            // reentrega para outra instância.
             break;
           }
           const task = this.processMessage(message).finally(() => {
@@ -119,10 +77,6 @@ export class SqsConsumer {
           this.inFlight.add(task);
         }
       } catch (err) {
-        // Erro ao falar com o próprio SQS (não com o processamento de uma
-        // mensagem específica) — loga e continua o loop após um pequeno
-        // backoff, para não girar em círculo consumindo CPU/rede.
-        // eslint-disable-next-line no-console
         console.error('[SqsConsumer] receive loop error:', err);
         await sleep(1000);
       }
@@ -131,11 +85,6 @@ export class SqsConsumer {
     this.running = false;
   }
 
-  /**
-   * Sinaliza para o loop parar de puxar mensagens novas e aguarda as que já
-   * estão em andamento terminarem (ack ou não-ack) antes de retornar.
-   * Chamado a partir do handler de SIGTERM em main.ts.
-   */
   async stop(): Promise<void> {
     this.stopRequested = true;
     await Promise.allSettled(Array.from(this.inFlight));
@@ -159,23 +108,12 @@ export class SqsConsumer {
 
   private async processMessage(message: Message): Promise<void> {
     const receiptHandle = message.ReceiptHandle!;
-    // Remove um possível BOM (Byte Order Mark, \uFEFF) no início do corpo.
-    // Alguns produtores (ex.: PowerShell no Windows, dependendo da
-    // codificação usada para escrever o payload) inserem esse marcador
-    // invisível, que quebra JSON.parse mesmo que o restante do JSON esteja
-    // perfeitamente válido.
     const rawBody = (message.Body ?? '').replace(/^\uFEFF/, '');
 
     let envelope: WagerTransactionMessageEnvelope;
     try {
       envelope = JSON.parse(rawBody);
     } catch (err) {
-      // Payload não é nem JSON válido — erro permanente, não adianta
-      // retentar. Não faz ack aqui de propósito: deixamos o SQS aplicar sua
-      // própria política de maxReceiveCount -> DLQ, para manter um único
-      // caminho de "mensagens problemáticas acabam na DLQ" em vez de dois
-      // (ack manual vs. redrive policy).
-      // eslint-disable-next-line no-console
       console.error('[SqsConsumer] malformed message body, will retry until DLQ:', rawBody, err);
       return;
     }
@@ -183,7 +121,6 @@ export class SqsConsumer {
     const messageId = envelope.messageId ?? message.MessageId!;
     const payloadHash = createHash('sha256').update(JSON.stringify(envelope.data)).digest('hex');
 
-    // 1) Dedup via inbox — checagem rápida antes de qualquer trabalho de negócio.
     const alreadyProcessed = await this.uow.run((tx) => this.inbox.findByKey(CONSUMER_NAME, messageId, tx));
     if (alreadyProcessed?.isProcessed()) {
       await this.ack(receiptHandle);
@@ -205,33 +142,19 @@ export class SqsConsumer {
         correlationId: messageId,
       });
 
-      // PROCESSED, REJECTED e PENDING_REFERENCE são todos resultados
-      // "tratados com sucesso" do ponto de vista do consumer — nenhum deve
-      // ser retentado pelo SQS, por isso fazemos ack em todos eles.
       await this.markProcessedInInbox(messageId, payloadHash);
       await this.ack(receiptHandle);
-      // eslint-disable-next-line no-console
       console.log(
         `[SqsConsumer] processed messageId=${messageId} kind=${envelope.data.kind} status=${result.status} walletId=${envelope.data.walletId}`,
       );
     } catch (err) {
       if (err instanceof DomainError) {
-        // Erro de negócio que o use case não conseguiu nem classificar como
-        // REJECTED estruturado (ex.: IdempotencyConflictError por payload
-        // divergente). É um problema de dados, não de infraestrutura —
-        // retentar não vai resolver. Registramos e fazemos ack para não
-        // girar em loop de redelivery para sempre.
-        // eslint-disable-next-line no-console
         console.error('[SqsConsumer] business/domain error, acking (non-retryable):', err.code, err.message);
         await this.markProcessedInInbox(messageId, payloadHash);
         await this.ack(receiptHandle);
         return;
       }
 
-      // Qualquer outro erro é tratado como transitório de infraestrutura
-      // (Postgres fora do ar, timeout de rede, etc.) — NÃO fazemos ack.
-      // A mensagem volta a ficar visível após o visibility timeout e é
-      // reentregue automaticamente pelo SQS.
       recordSqsRedelivery();
       logEvent('error', 'sqs message processing failed transiently, will be redelivered', {
         messageId,
@@ -258,14 +181,6 @@ export class SqsConsumer {
     );
   }
 
-  /**
-   * Extensão possível (não implementada): em vez de simplesmente esperar o
-   * visibility timeout expirar em stop(), poderíamos chamar
-   * ChangeMessageVisibilityCommand com VisibilityTimeout: 0 nas mensagens
-   * ainda não iniciadas no momento do SIGTERM, devolvendo a visibilidade
-   * imediatamente em vez de esperar o timeout — reduz a latência de
-   * reentrega para outra instância. Ver ARCHITECTURE.md.
-   */
 }
 
 function sleep(ms: number): Promise<void> {

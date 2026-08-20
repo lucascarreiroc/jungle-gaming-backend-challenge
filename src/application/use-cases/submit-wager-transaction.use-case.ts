@@ -70,19 +70,8 @@ export class WalletNotFoundError extends DomainError {
 
 const MAX_OPTIMISTIC_LOCK_RETRIES = 5;
 
-/**
- * Limite de tentativas de resolução de referência para REFUND/ROLLBACK
- * (seção 7.1 do desafio). Compartilhado entre o primeiro encontro (via
- * execute()) e as retentativas subsequentes do PendingReferenceWorker.
- */
 export const MAX_REFERENCE_WAIT_ATTEMPTS = 10;
 
-/**
- * Canonicaliza o subconjunto de campos de negócio do payload (chaves
- * ordenadas) para gerar o payloadHash. Header e metadados de transporte
- * (Idempotency-Key literal, timestamps de fila, etc.) NÃO entram no hash —
- * apenas o conteúdo que, se mudasse, tornaria a requisição "diferente".
- */
 export function computePayloadHash(input: SubmitWagerTransactionInput): string {
   const canonical = {
     providerId: input.providerId,
@@ -99,21 +88,6 @@ export function computePayloadHash(input: SubmitWagerTransactionInput): string {
   return createHash('sha256').update(json).digest('hex');
 }
 
-/**
- * Orquestra a submissão de uma WagerTransaction. Usado pelo controller HTTP,
- * pelo consumer SQS (ver seção 10 do desafio: "reutilizar o mesmo use case
- * da entrada HTTP") e pelo PendingReferenceWorker (via resumePendingReference).
- *
- * Estratégia de concorrência (ver seção 8): optimistic locking na Wallet via
- * coluna `version`. Se o UPDATE afeta 0 linhas, o caso de uso re-lê a wallet
- * e retenta a operação de domínio do zero, até MAX_OPTIMISTIC_LOCK_RETRIES
- * vezes. Isso evita lock global compartilhado entre wallets distintas —
- * cada wallet é serializada apenas contra si mesma, então wallets diferentes
- * processam em paralelo sem qualquer contenção entre si.
- *
- * Atomicidade: transação SQL, alteração de saldo, ledger e outbox são
- * confirmados juntos, ou nada é (ver seção 11).
- */
 export class SubmitWagerTransactionUseCase {
   constructor(
     private readonly uow: UnitOfWork,
@@ -131,12 +105,6 @@ export class SubmitWagerTransactionUseCase {
     try {
       result = await this.executeInsideTransaction(input);
     } catch (err) {
-      // Corrida de idempotência: duas requisições com a MESMA idempotencyKey
-      // passaram pelo SELECT antes de qualquer uma commitar (janela real sob
-      // alta concorrência). A segunda perde a corrida no INSERT, protegida
-      // pela constraint UNIQUE(provider_id, idempotency_key) do schema — não
-      // pela lógica de aplicação. Aqui tratamos isso como o que
-      // semanticamente é: um replay idempotente, não um erro para o chamador.
       if (this.isIdempotencyUniqueViolation(err)) {
         result = await this.uow.run((tx) =>
           this.buildReplayResponseByKey(input.providerId, input.idempotencyKey, tx),
@@ -169,12 +137,6 @@ export class SubmitWagerTransactionUseCase {
     return result;
   }
 
-  /**
-   * Retoma o processamento de uma transação que está em PENDING_REFERENCE,
-   * tentando resolver a referência de novo. Chamado pelo PendingReferenceWorker.
-   * Reutiliza a mesma lógica de resolução de referência e mutação de saldo
-   * de execute() (via processTransaction) — não é uma cópia paralela dela.
-   */
   async resumePendingReference(transactionId: string): Promise<SubmitWagerTransactionOutput> {
     return this.uow.run(async (tx) => {
       const transaction = await this.transactions.findById(transactionId, tx);
@@ -182,9 +144,6 @@ export class SubmitWagerTransactionUseCase {
         throw new Error(`WagerTransaction ${transactionId} not found for resumePendingReference`);
       }
       if (transaction.status !== WagerTransactionStatus.PendingReference) {
-        // Já foi resolvida por outra instância do worker (ou pelo fluxo
-        // síncrono original) entre o momento em que este worker leu o lote
-        // e agora — não é um erro, apenas retornamos o estado atual.
         return this.buildReplayResponse(transaction, tx);
       }
       return this.processTransaction(transaction, tx);
@@ -216,7 +175,6 @@ export class SubmitWagerTransactionUseCase {
     const payloadHash = computePayloadHash(input);
 
     return this.uow.run(async (tx) => {
-      // 1) Checagem de idempotência - fonte da verdade é (providerId, idempotencyKey).
       const existing = await this.transactions.findByIdempotencyKey(
         input.providerId,
         input.idempotencyKey,
@@ -226,8 +184,6 @@ export class SubmitWagerTransactionUseCase {
         if (!existing.matchesPayload(payloadHash)) {
           throw new IdempotencyConflictError();
         }
-        // Replay idempotente: retorna o resultado original, incluindo o
-        // saldo observado naquele momento (não o saldo atual da wallet).
         return this.buildReplayResponse(existing, tx);
       }
 
@@ -254,13 +210,6 @@ export class SubmitWagerTransactionUseCase {
     });
   }
 
-  /**
-   * Núcleo compartilhado: resolve referência (se necessário) e aplica a
-   * mutação de saldo. Chamado tanto para uma transação recém-criada quanto
-   * para uma retomada de PENDING_REFERENCE — o comportamento é idêntico nos
-   * dois casos, o que evita ter duas implementações divergentes da mesma
-   * regra de negócio.
-   */
   private async processTransaction(
     transaction: WagerTransaction,
     tx: unknown,
@@ -268,7 +217,6 @@ export class SubmitWagerTransactionUseCase {
     const money = transaction.money;
     const correlationId = transaction.id;
 
-    // 2) Resolve referência para REFUND/ROLLBACK.
     let reference: WagerTransaction | null = null;
     if (transaction.requiresReference()) {
       reference = await this.transactions.findByExternalId(
@@ -280,9 +228,6 @@ export class SubmitWagerTransactionUseCase {
         transaction.incrementReferenceCheckAttempts();
 
         if (transaction.referenceCheckAttempts >= MAX_REFERENCE_WAIT_ATTEMPTS) {
-          // Esgotado o limite de tentativas (seção 7.1): rejeita com um
-          // failureCode que identifica especificamente esse motivo, e
-          // publica o evento correspondente.
           transaction.reject(FailureCode.REFERENCE_NOT_FOUND_TIMEOUT);
           await this.transactions.update(transaction, tx);
           await this.enqueueEvent(
@@ -330,13 +275,8 @@ export class SubmitWagerTransactionUseCase {
         };
       }
 
-      // Nota: "uma referência não pode ser revertida duas vezes pelo mesmo
-      // tipo de operação" é garantido pelos índices únicos parciais
-      // uq_wager_tx_single_refund_per_reference / ..._rollback_per_reference
-      // no schema (ver migrations/001_init.sql), não por uma checagem aqui.
     }
 
-    // 3) Aplica a mutação de saldo com retry em caso de conflito otimista.
     if (!transaction.affectsBalance()) {
       transaction.markProcessed(reference?.id, this.clock.now());
       await this.transactions.update(transaction, tx);
@@ -380,7 +320,7 @@ export class SubmitWagerTransactionUseCase {
             await this.transactions.update(transaction, tx);
             throw new Error('Exceeded optimistic lock retries for wallet ' + wallet.id);
           }
-          continue; // re-lê a wallet e tenta de novo
+          continue;
         }
 
         const direction = transaction.ledgerDirectionFor(reference ?? undefined);

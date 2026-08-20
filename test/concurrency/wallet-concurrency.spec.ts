@@ -4,14 +4,6 @@ import { WagerTransactionKind, WagerTransactionStatus, LedgerDirection } from '.
 import { FailureCode } from '../../src/domain/errors';
 import { createTestContext } from '../support/test-db';
 
-/**
- * Estes testes exigem Postgres real rodando (docker-compose) e DATABASE_URL
- * setado. Ver README.md. Não usam mocks — a garantia de concorrência só é
- * comprovada com paralelismo de verdade (Promise.all disparando múltiplas
- * conexões simultâneas do pool contra o mesmo banco).
- *
- * Rodar com: bun test test/concurrency
- */
 const ctx = createTestContext();
 
 afterAll(async () => {
@@ -53,7 +45,6 @@ describe('Wallet concurrency (real Postgres, real parallelism)', () => {
       expect(wallet?.balance.toJSON().amount).toBe('20.00');
 
       const entries = await ctx.getLedgerEntries(walletId);
-      // 1 OPENING (credit) + 1 BET (debit) = 2 entries. Only one debit, never two.
       const debits = entries.filter((e) => e.direction === LedgerDirection.Debit);
       expect(debits.length).toBe(1);
     },
@@ -73,12 +64,11 @@ describe('Wallet concurrency (real Postgres, real parallelism)', () => {
       const processed = results.filter((r) => r.status === WagerTransactionStatus.Processed);
       const replays = results.filter((r) => r.idempotentReplay);
 
-      // Exactly one "original" processing; the other 49 are idempotent replays.
-      expect(processed.length).toBe(50); // all report PROCESSED (either original or replay)
+      expect(processed.length).toBe(50);
       expect(replays.length).toBe(49);
 
       const wallet = await ctx.getWallet(walletId);
-      expect(wallet?.balance.toJSON().amount).toBe('990.00'); // 1000 - 10, only once
+      expect(wallet?.balance.toJSON().amount).toBe('990.00');
 
       const entries = await ctx.getLedgerEntries(walletId);
       const debits = entries.filter((e) => e.direction === LedgerDirection.Debit);
@@ -108,10 +98,6 @@ describe('Wallet concurrency (real Postgres, real parallelism)', () => {
       expect(balanceA?.balance.toJSON().amount).toBe('70.00');
       expect(balanceB?.balance.toJSON().amount).toBe('70.00');
 
-      // Não é uma asserção de performance rígida (ambiente de CI pode variar),
-      // apenas um sinal de que não houve serialização artificial entre
-      // wallets distintas (ex.: um lock global teria feito isso demorar
-      // visivelmente mais que uma única operação).
       expect(elapsed).toBeLessThan(5000);
     },
     15000,
@@ -122,8 +108,6 @@ describe('Wallet concurrency (real Postgres, real parallelism)', () => {
     async () => {
       const { walletId, playerId } = await ctx.createFundedWallet('100.00');
 
-      // 3 bets of 40.00 each against a 100.00 balance: exactly 2 should
-      // succeed (80.00 total) and 1 should be rejected.
       const results = await Promise.all([
         submitBet(walletId, playerId, `tx-three-1-${randomUUID()}`, '40.00'),
         submitBet(walletId, playerId, `tx-three-2-${randomUUID()}`, '40.00'),

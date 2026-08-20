@@ -41,7 +41,6 @@ describe('Wallet', () => {
     expect(() => wallet.debit(Money.from({ amount: '50.01', currency: 'BRL' }))).toThrow(
       InsufficientBalanceError,
     );
-    // state unchanged after a rejected debit
     expect(wallet.balance.toJSON().amount).toBe('50.00');
     expect(wallet.version).toBe(1);
   });
@@ -79,18 +78,14 @@ describe('Wallet', () => {
   });
 
   it('the mandatory scenario: two concurrent 80.00 bets on a 100.00 balance', () => {
-    // This test demonstrates the domain-level invariant in isolation
-    // (single-threaded). The actual concurrency guarantee across processes
-    // is enforced at the persistence layer via optimistic locking - see
-    // test/concurrency/wallet-concurrency.spec.ts and ARCHITECTURE.md.
     const wallet = openWallet('100.00');
     const bet = Money.from({ amount: '80.00', currency: 'BRL' });
 
-    wallet.debit(bet); // first bet succeeds
+    wallet.debit(bet);
     expect(wallet.balance.toJSON().amount).toBe('20.00');
 
-    expect(() => wallet.debit(bet)).toThrow(InsufficientBalanceError); // second bet rejected
-    expect(wallet.balance.toJSON().amount).toBe('20.00'); // unchanged
+    expect(() => wallet.debit(bet)).toThrow(InsufficientBalanceError);
+    expect(wallet.balance.toJSON().amount).toBe('20.00');
   });
 
   it('rehydrate reconstructs an equivalent wallet without revalidating transitions', () => {

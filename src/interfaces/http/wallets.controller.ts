@@ -121,13 +121,6 @@ export class WalletsController {
     };
   }
 
-  /**
-   * Reconciliação: compara o saldo materializado na wallet (fonte "rápida",
-   * usada no dia a dia) com o saldo recalculado a partir da soma de todos os
-   * lançamentos do ledger (fonte "lenta", mas auditável). Se divergirem, é
-   * sinal de um bug de consistência — a divergência é reportada, não
-   * corrigida silenciosamente (ver seção 9 do desafio).
-   */
   @Post(':walletId/reconciliation')
   async reconcile(@Param('walletId') walletId: string) {
     const wallet = await this.uow.run((tx) => this.wallets.findById(walletId, tx));
@@ -146,10 +139,6 @@ export class WalletsController {
     const consistent = difference.isZero();
 
     if (!consistent) {
-      // Ver ARCHITECTURE.md: em produção real isto também incrementaria uma
-      // métrica dedicada (ex.: wallet_reconciliation_mismatch_total) e
-      // geraria um log estruturado de alerta — aqui, um log simples.
-      // eslint-disable-next-line no-console
       console.error(
         `[Reconciliation] MISMATCH walletId=${walletId} stored=${storedBalance.toString()} calculated=${calculatedBalance.toString()}`,
       );
@@ -166,11 +155,6 @@ export class WalletsController {
   }
 }
 
-/**
- * `SUM(numeric)` do Postgres pode retornar algo como "10" em vez de "10.00"
- * quando o resultado é um número inteiro — normaliza para a escala fixa de
- * 2 casas que `Money.from` exige.
- */
 function normalizeDecimalString(raw: string): string {
   const [whole, fraction = ''] = raw.split('.');
   return `${whole}.${fraction.padEnd(2, '0').slice(0, 2)}`;

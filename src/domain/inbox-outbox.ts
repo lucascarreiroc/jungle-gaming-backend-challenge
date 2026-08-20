@@ -15,10 +15,6 @@ export interface InboxMessageState {
   processedAt?: Date;
 }
 
-/**
- * InboxMessage garante deduplicação persistente por (consumerName, messageId).
- * Unicidade é reforçada por constraint composta no schema (ver migrations).
- */
 export class InboxMessage {
   private constructor(
     public readonly messageId: string,
@@ -71,7 +67,6 @@ export interface OutboxMessageState {
   publishedAt?: Date;
 }
 
-/** Backoff exponencial com jitter, cap em 5 minutos. Ver ARCHITECTURE.md. */
 function computeBackoff(attempts: number): number {
   const baseMs = 1000;
   const capMs = 5 * 60 * 1000;
@@ -80,12 +75,6 @@ function computeBackoff(attempts: number): number {
   return Math.floor(exp + jitter);
 }
 
-/**
- * OutboxMessage participa da mesma transação SQL que a mutação financeira
- * (ver seção 11 do desafio). Um worker separado publica mensagens pendentes
- * e marca publishedAt somente após confirmação do broker — publicações
- * duplicadas são seguras porque os consumidores fazem dedup via Inbox.
- */
 export class OutboxMessage {
   private constructor(
     public readonly id: string,
@@ -149,7 +138,6 @@ export class OutboxMessage {
     this._publishedAt = at;
   }
 
-  /** Incrementa attempts e calcula o próximo nextAttemptAt (backoff exponencial + jitter). */
   scheduleRetry(now: Date): void {
     this._attempts += 1;
     this._nextAttemptAt = new Date(now.getTime() + computeBackoff(this._attempts));

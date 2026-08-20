@@ -2,12 +2,6 @@ import { Controller, Get, HttpException, HttpStatus, Inject } from '@nestjs/comm
 import { Pool } from 'pg';
 import { TOKENS } from '../../tokens';
 
-/**
- * Health checks não exigem autenticação (ver seção 2 do desafio).
- * /live: processo está de pé, sem checar dependências externas.
- * /ready: PostgreSQL (e, quando o consumer SQS existir, o próprio SQS)
- *         estão alcançáveis.
- */
 @Controller('health')
 export class HealthController {
   constructor(@Inject(TOKENS.PG_POOL) private readonly pool: Pool) {}

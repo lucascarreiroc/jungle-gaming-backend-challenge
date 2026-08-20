@@ -1,8 +1,8 @@
 import Decimal from 'decimal.js';
 
 export interface MoneyProps {
-  amount: string; // decimal string, ex.: "25.00"
-  currency: string; // ISO-4217
+  amount: string;
+  currency: string;
 }
 
 export class DomainError extends Error {
@@ -29,17 +29,6 @@ export class CurrencyMismatchError extends DomainError {
 
 const DECIMAL_STRING_REGEX = /^\d+\.\d{2}$/;
 
-/**
- * Money é um Value Object imutável. Toda operação retorna uma nova instância.
- *
- * Decisões de design (ver ARCHITECTURE.md):
- * - Nunca usa number/float internamente — usa Decimal.js.
- * - amount é sempre serializado como string decimal com escala fixa de 2 casas.
- * - Rejeita entradas inválidas na fronteira (NaN, Infinity, notação científica,
- *   string vazia, mais de 2 casas decimais, valores negativos em contratos de entrada).
- * - Não depende de tipos monetários do ORM nem de decorators do NestJS —
- *   é POJO puro de domínio.
- */
 export class Money {
   private constructor(
     private readonly value: Decimal,
@@ -54,7 +43,6 @@ export class Money {
       throw new InvalidMoneyError('currency must be a valid ISO-4217 code');
     }
     if (props.amount.trim() === '' || !DECIMAL_STRING_REGEX.test(props.amount)) {
-      // Rejects NaN, Infinity, scientific notation, empty string, wrong scale.
       throw new InvalidMoneyError(
         `amount must be a decimal string with exactly 2 decimal places, got "${props.amount}"`,
       );
@@ -68,11 +56,6 @@ export class Money {
     return new Money(decimal, props.currency.toUpperCase());
   }
 
-  /**
-   * Uso interno de domínio (ex.: negate(), diferenças de reconciliação) onde
-   * um valor negativo é uma representação legítima de uma operação, não uma
-   * entrada de usuário. Não exposto como API pública de contrato.
-   */
   private static fromDecimal(value: Decimal, currency: string): Money {
     return new Money(value, currency);
   }

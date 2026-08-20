@@ -2,7 +2,7 @@ import { Money } from './money';
 import { FailureCode, InvalidTransactionStateError } from './errors';
 
 export enum WagerTransactionKind {
-  Opening = 'OPENING', // interno: crédito de abertura da wallet
+  Opening = 'OPENING',
   Bet = 'BET',
   Win = 'WIN',
   Loss = 'LOSS',
@@ -11,11 +11,11 @@ export enum WagerTransactionKind {
 }
 
 export enum WagerTransactionStatus {
-  Pending = 'PENDING', // aceita, ainda não aplicada
-  PendingReference = 'PENDING_REFERENCE', // aguardando a transação referenciada
-  Processed = 'PROCESSED', // aplicada (terminal)
-  Rejected = 'REJECTED', // violação de regra de negócio (terminal)
-  Failed = 'FAILED', // erro permanente de infraestrutura (terminal, auditável)
+  Pending = 'PENDING',
+  PendingReference = 'PENDING_REFERENCE',
+  Processed = 'PROCESSED',
+  Rejected = 'REJECTED',
+  Failed = 'FAILED',
 }
 
 const TERMINAL_STATUSES = new Set([
@@ -66,13 +66,8 @@ export interface WagerTransactionState {
   referenceCheckAttempts?: number;
 }
 
-/**
- * Kinds que exigem uma referência para uma transação PROCESSED existente.
- * OPENING nunca é submetido externamente (ver requiresReference / validação em create()).
- */
 const KINDS_REQUIRING_REFERENCE = new Set([WagerTransactionKind.Refund, WagerTransactionKind.Rollback]);
 
-/** Kinds que não alteram o saldo da wallet — apenas registram o resultado. */
 const KINDS_NOT_AFFECTING_BALANCE = new Set([WagerTransactionKind.Loss]);
 
 export class WagerTransaction {
@@ -97,7 +92,6 @@ export class WagerTransaction {
     private _referenceCheckAttempts: number = 0,
   ) {}
 
-  /** Nasce em PENDING. Valida a exigência de referência por kind. */
   static create(props: CreateWagerTransactionProps): WagerTransaction {
     if (props.kind === WagerTransactionKind.Opening) {
       throw new Error('OPENING transactions cannot be created through the public factory');
@@ -123,10 +117,6 @@ export class WagerTransaction {
     );
   }
 
-  /**
-   * Cria a transação interna OPENING, gerada apenas pelo próprio sistema
-   * durante a criação de uma wallet com saldo inicial > 0.
-   */
   static createOpening(props: {
     id: string;
     walletId: string;
@@ -195,17 +185,9 @@ export class WagerTransaction {
     return this._referenceCheckAttempts;
   }
 
-  /**
-   * Incrementa o contador de tentativas de resolução de referência (usado
-   * pelo PendingReferenceWorker). Não é uma transição de status — pode ser
-   * chamado enquanto a transação estiver em PENDING_REFERENCE, sem afetar
-   * o campo `status`.
-   */
   incrementReferenceCheckAttempts(): void {
     this._referenceCheckAttempts += 1;
   }
-
-  // ---- transições ----
 
   markProcessed(referenceTransactionId: string | undefined, at: Date): void {
     this.assertNotTerminal(WagerTransactionStatus.Processed);
@@ -237,8 +219,6 @@ export class WagerTransaction {
     }
   }
 
-  // ---- consultas de domínio ----
-
   isTerminal(): boolean {
     return TERMINAL_STATUSES.has(this._status);
   }
@@ -255,11 +235,6 @@ export class WagerTransaction {
     return this.payloadHash === payloadHash;
   }
 
-  /**
-   * Determina a direção do lançamento no ledger para esta transação.
-   * BET -> DEBIT. WIN/REFUND -> CREDIT.
-   * ROLLBACK -> direção inversa à da transação referenciada.
-   */
   ledgerDirectionFor(reference?: WagerTransaction): LedgerDirection {
     switch (this.kind) {
       case WagerTransactionKind.Bet:

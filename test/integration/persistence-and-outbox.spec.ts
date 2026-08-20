@@ -7,20 +7,12 @@ import { PendingReferenceWorker } from '../../src/application/workers/pending-re
 import type { EventPublisher } from '../../src/application/ports';
 import { createTestContext } from '../support/test-db';
 
-/**
- * Testes de integração com Postgres REAL (não migrations/constraints/outbox
- * mockados). Requer DATABASE_URL setado e as migrations 001 e 002 aplicadas.
- * Rodar com: bun test test/integration
- */
 const ctx = createTestContext();
 
 afterAll(async () => {
   await ctx.close();
 });
 
-// ----------------------------------------------------------------------------
-// 1) Migrations e constraints — o schema, não só o código, garante as invariantes.
-// ----------------------------------------------------------------------------
 describe('Schema constraints (enforced by Postgres itself)', () => {
   it('rejects a negative wallet balance at the database level', async () => {
     const client = await ctx.pool.connect();
@@ -77,7 +69,6 @@ describe('Schema constraints (enforced by Postgres itself)', () => {
     const client = await ctx.pool.connect();
     try {
       await client.query('BEGIN');
-      // Cria uma wager_transaction válida só para satisfazer a FK.
       const txId = randomUUID();
       await client.query(
         `INSERT INTO wager_transactions (
@@ -88,7 +79,6 @@ describe('Schema constraints (enforced by Postgres itself)', () => {
       );
       let threw = false;
       try {
-        // balanceBefore=100, DEBIT 10, mas balanceAfter errado propositalmente (85 em vez de 90).
         await client.query(
           `INSERT INTO wallet_ledger_entries (
             id, wallet_id, transaction_id, direction, money_amount, money_currency,
@@ -108,9 +98,6 @@ describe('Schema constraints (enforced by Postgres itself)', () => {
   });
 });
 
-// ----------------------------------------------------------------------------
-// 2) Atomicidade entre wallet, ledger e outbox numa transação bem-sucedida.
-// ----------------------------------------------------------------------------
 describe('Atomicity: wallet + ledger + transaction + outbox in a single commit', () => {
   it('a successful BET updates wallet, creates a ledger entry, and enqueues outbox events together', async () => {
     const { walletId, playerId } = await ctx.createFundedWallet('100.00');
@@ -132,8 +119,6 @@ describe('Atomicity: wallet + ledger + transaction + outbox in a single commit',
     expect(betEntry).toBeDefined();
     expect(betEntry?.direction).toBe(LedgerDirection.Debit);
 
-    // Confirma que os eventos foram enfileirados na outbox (não publicados
-    // ainda — isso é responsabilidade do OutboxPublisherWorker, seção 3).
     const outboxRows = await ctx.pool.query(
       `SELECT event_type FROM outbox_messages WHERE aggregate_id = $1 OR aggregate_id = $2 ORDER BY occurred_at`,
       [result.transactionId, walletId],
@@ -144,9 +129,6 @@ describe('Atomicity: wallet + ledger + transaction + outbox in a single commit',
   });
 });
 
-// ----------------------------------------------------------------------------
-// 3) OutboxPublisherWorker: publica, e lida com falha de publicação com retry.
-// ----------------------------------------------------------------------------
 class FakeEventPublisher implements EventPublisher {
   public published: Array<{ destination: string; message: Record<string, unknown> }> = [];
   public failNextN = 0;
@@ -161,12 +143,6 @@ class FakeEventPublisher implements EventPublisher {
 }
 
 describe('OutboxPublisherWorker (real Postgres, fake network publisher)', () => {
-  // Nota de design: usamos um FakeEventPublisher aqui em vez de um SQS real
-  // (LocalStack) porque o que este teste valida é o mecanismo de locking e
-  // retry do WORKER sobre o Postgres — não a integração de rede com o SQS
-  // em si, que já foi validada manualmente (ver README.md, seção "Testando
-  // o SqsConsumer") e é a mesma infraestrutura usada pelo SqsEventPublisher
-  // real. Isso mantém o teste rápido e determinístico. Ver ARCHITECTURE.md.
   it('publishes pending outbox messages and marks them as published', async () => {
     const { walletId, playerId } = await ctx.createFundedWallet('50.00');
     const result = await ctx.submit({
@@ -201,14 +177,12 @@ describe('OutboxPublisherWorker (real Postgres, fake network publisher)', () => 
     });
 
     const publisher = new FakeEventPublisher();
-    publisher.failNextN = 100; // força falha em tudo deste lote
+    publisher.failNextN = 100;
     const worker = new OutboxPublisherWorker(ctx.uow, ctx.outbox, publisher, ctx.clock, 'fake-destination', 50);
 
     const { failed } = await worker.runOnce();
     expect(failed).toBeGreaterThanOrEqual(1);
 
-    // As mensagens continuam pendentes (não publicadas), mas com attempts
-    // incrementado e next_attempt_at no futuro — não foram perdidas.
     const rows = await ctx.pool.query(
       `SELECT attempts, next_attempt_at, published_at FROM outbox_messages WHERE published_at IS NULL AND attempts > 0 ORDER BY occurred_at DESC LIMIT 5`,
     );
@@ -240,19 +214,15 @@ describe('OutboxPublisherWorker (real Postgres, fake network publisher)', () => 
       (p) => p.message.eventId as string,
     );
     const uniqueIds = new Set(allPublishedIds);
-    expect(uniqueIds.size).toBe(allPublishedIds.length); // nenhum duplicado entre os dois publishers
+    expect(uniqueIds.size).toBe(allPublishedIds.length);
   });
 });
 
-// ----------------------------------------------------------------------------
-// 4) PENDING_REFERENCE: REFUND chega antes da BET, worker resolve depois.
-// ----------------------------------------------------------------------------
 describe('Out-of-order references (section 7.1)', () => {
   it('a REFUND arriving before its BET is stored as PENDING_REFERENCE, then resolved by the worker once the BET exists', async () => {
     const { walletId, playerId } = await ctx.createFundedWallet('100.00');
     const betExternalId = `tx-bet-${randomUUID()}`;
 
-    // REFUND chega primeiro, referenciando uma BET que ainda não existe.
     const refundResult = await ctx.submit({
       walletId,
       playerId,
@@ -263,11 +233,9 @@ describe('Out-of-order references (section 7.1)', () => {
     });
     expect(refundResult.status).toBe(WagerTransactionStatus.PendingReference);
 
-    // Saldo não deve ter mudado ainda.
     const walletBefore = await ctx.getWallet(walletId);
     expect(walletBefore?.balance.toJSON().amount).toBe('100.00');
 
-    // Agora a BET chega e é processada normalmente.
     const betResult = await ctx.submit({
       walletId,
       playerId,
@@ -277,13 +245,11 @@ describe('Out-of-order references (section 7.1)', () => {
     });
     expect(betResult.status).toBe(WagerTransactionStatus.Processed);
 
-    // Worker resolve a referência pendente.
     const worker = new PendingReferenceWorker(ctx.uow, ctx.transactions, ctx.useCase);
     const { resolved } = await worker.runOnce();
     expect(resolved).toBeGreaterThanOrEqual(1);
 
     const walletAfter = await ctx.getWallet(walletId);
-    // BET debitou 20 (100 -> 80), REFUND creditou 20 de volta (80 -> 100).
     expect(walletAfter?.balance.toJSON().amount).toBe('100.00');
 
     const resolvedTransaction = await ctx.uow.run((tx) => ctx.transactions.findById(refundResult.transactionId, tx));
@@ -304,9 +270,6 @@ describe('Out-of-order references (section 7.1)', () => {
     expect(refundResult.status).toBe(WagerTransactionStatus.PendingReference);
 
     const worker = new PendingReferenceWorker(ctx.uow, ctx.transactions, ctx.useCase);
-    // MAX_REFERENCE_WAIT_ATTEMPTS é 10 (ver submit-wager-transaction.use-case.ts);
-    // a primeira submissão já contou como tentativa 1, então rodamos o
-    // worker o suficiente para esgotar as tentativas restantes.
     let finalStatus: string | undefined;
     for (let i = 0; i < 12; i++) {
       await worker.runOnce();
@@ -320,15 +283,11 @@ describe('Out-of-order references (section 7.1)', () => {
     const rejectedTransaction = await ctx.uow.run((tx) => ctx.transactions.findById(refundResult.transactionId, tx));
     expect(rejectedTransaction?.failureCode).toBe(FailureCode.REFERENCE_NOT_FOUND_TIMEOUT);
 
-    // Saldo não pode ter sido afetado por uma reversão que nunca foi aplicada.
     const wallet = await ctx.getWallet(walletId);
     expect(wallet?.balance.toJSON().amount).toBe('100.00');
   });
 });
 
-// ----------------------------------------------------------------------------
-// 5) Reconciliação: saldo materializado == saldo recalculado do ledger.
-// ----------------------------------------------------------------------------
 describe('Reconciliation', () => {
   it('stored balance matches the balance recalculated from the ledger after several operations', async () => {
     const { walletId, playerId } = await ctx.createFundedWallet('200.00');
@@ -340,11 +299,10 @@ describe('Reconciliation', () => {
     const wallet = await ctx.getWallet(walletId);
     const { balance: calculatedRaw } = await ctx.uow.run((tx) => ctx.ledger.sumByWallet(walletId, tx));
 
-    // Normaliza a string do SUM (Postgres pode retornar "175" em vez de "175.00").
     const [whole, fraction = ''] = calculatedRaw.split('.');
     const calculated = `${whole}.${fraction.padEnd(2, '0').slice(0, 2)}`;
 
     expect(wallet?.balance.toJSON().amount).toBe(calculated);
-    expect(wallet?.balance.toJSON().amount).toBe('175.00'); // 200 - 30 - 10 + 15
+    expect(wallet?.balance.toJSON().amount).toBe('175.00');
   });
 });

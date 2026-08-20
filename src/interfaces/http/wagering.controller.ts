@@ -21,16 +21,6 @@ interface SubmitTransactionBody {
   referenceExternalTransactionId?: string;
 }
 
-/**
- * Mapeamento de status HTTP (decisão do desafio, seção 9):
- * - 200/201: sucesso (PROCESSED) ou aceite assíncrono (PENDING_REFERENCE -> 202)
- * - 400: payload inválido (VALIDATION_*)
- * - 409: conflito de idempotência (payload divergente) ou wallet duplicada
- * - 422: rejeição de regra de negócio (BUSINESS_*) — payload válido, mas a
- *        operação não pôde ser aplicada; distinto de 400 para o provedor
- *        não tentar "corrigir" algo que já estava sintaticamente correto.
- * - 503: falha transitória de infraestrutura (INFRA_*) — o provedor deve reenviar.
- */
 @Controller()
 export class WageringController {
   constructor(

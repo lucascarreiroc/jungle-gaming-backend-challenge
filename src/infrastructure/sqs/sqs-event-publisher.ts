@@ -7,16 +7,6 @@ export interface SqsEventPublisherConfig {
   endpoint?: string;
 }
 
-/**
- * Publica eventos de domínio (WagerTransactionProcessed, WalletBalanceChanged,
- * etc.) em uma fila SQS FIFO. Usado pelo OutboxPublisherWorker — nunca
- * chamado diretamente pelos use cases (ver seção 11 do desafio: eventos só
- * saem depois do commit, via outbox).
- *
- * `destination` (parâmetro de `publish`) é a URL da fila. O `aggregateId`
- * do evento vira o MessageGroupId, garantindo ordenação FIFO por agregado
- * (ex.: todos os eventos da mesma wallet mantêm ordem relativa entre si).
- */
 export class SqsEventPublisher implements EventPublisher {
   private readonly client: SQSClient;
 

@@ -35,11 +35,6 @@ async function bootstrap() {
   let pendingReferenceTimer: ReturnType<typeof setInterval> | undefined;
   let dlqPollTimer: ReturnType<typeof setInterval> | undefined;
 
-  // --- Profundidade da DLQ (métrica, seção 12) ---
-  // A DLQ é gerenciada pelo próprio SQS (via redrive policy configurada na
-  // fila, fora do código da aplicação — ver ARCHITECTURE.md). O código não
-  // decide "mover para a DLQ"; só observa quantas mensagens estão lá, como
-  // sinal de saúde do pipeline.
   const dlqUrl = process.env.SQS_DLQ_URL;
   if (dlqUrl) {
     const sqsClient = new SQSClient({
@@ -59,19 +54,11 @@ async function bootstrap() {
           setDlqDepth(count);
         })
         .catch((err) => {
-          // eslint-disable-next-line no-console
           console.error('[main] failed to poll DLQ depth:', err);
         });
     }, 10000);
   }
 
-  // --- Outbox publisher (seção 11 do desafio) ---
-  // Roda por padrão sempre que a aplicação sobe, pois é parte central da
-  // garantia de "eventos nunca publicados antes do commit". Só é pulado se
-  // a fila de destino não estiver configurada (ambiente de desenvolvimento
-  // sem LocalStack pronto, por exemplo) — nesse caso, os eventos continuam
-  // sendo gravados na outbox normalmente, só não são publicados até a
-  // variável ser configurada e a aplicação reiniciada.
   const eventsQueueUrl = process.env.WAGER_EVENTS_QUEUE_URL;
   if (eventsQueueUrl) {
     const outboxRepo = new PostgresOutboxRepository();
@@ -83,32 +70,26 @@ async function bootstrap() {
 
     outboxTimer = setInterval(() => {
       outboxWorker.runOnce().catch((err) => {
-        // eslint-disable-next-line no-console
         console.error('[OutboxPublisherWorker] error:', err);
       });
     }, OUTBOX_PUBLISH_INTERVAL_MS);
   } else {
-    // eslint-disable-next-line no-console
     console.warn(
       '[main] WAGER_EVENTS_QUEUE_URL não definida — OutboxPublisherWorker não vai rodar. ' +
         'Eventos continuam sendo gravados na tabela outbox_messages, mas não serão publicados no SQS.',
     );
   }
 
-  // --- Pending reference worker (seção 7.1 do desafio) ---
-  // Não depende de nenhuma fila, só do Postgres — roda sempre.
   {
     const transactionsRepo = new PostgresWagerTransactionRepository();
     const pendingReferenceWorker = new PendingReferenceWorker(uow, transactionsRepo, useCase);
     pendingReferenceTimer = setInterval(() => {
       pendingReferenceWorker.runOnce().catch((err) => {
-        // eslint-disable-next-line no-console
         console.error('[PendingReferenceWorker] error:', err);
       });
     }, PENDING_REFERENCE_INTERVAL_MS);
   }
 
-  // --- SQS consumer (opcional, ver README "Testando o SqsConsumer") ---
   if (process.env.ENABLE_SQS_CONSUMER === 'true') {
     const inbox = new PostgresInboxRepository();
 
@@ -124,15 +105,11 @@ async function bootstrap() {
     );
 
     sqsConsumer.start().catch((err) => {
-      // eslint-disable-next-line no-console
       console.error('[SqsConsumer] fatal error in polling loop:', err);
     });
   }
 
-  // Shutdown gracioso (ver seção 10 do desafio: "em SIGTERM, concluir
-  // mensagens em andamento ou devolver a visibilidade").
   const shutdown = async (signal: string) => {
-    // eslint-disable-next-line no-console
     console.log(`[main] received ${signal}, shutting down gracefully...`);
     if (outboxTimer) clearInterval(outboxTimer);
     if (pendingReferenceTimer) clearInterval(pendingReferenceTimer);
@@ -147,7 +124,6 @@ async function bootstrap() {
   process.on('SIGINT', () => void shutdown('SIGINT'));
 
   await app.listen(port);
-  // eslint-disable-next-line no-console
   console.log(`Wagering Processor listening on port ${port}`);
 }
 

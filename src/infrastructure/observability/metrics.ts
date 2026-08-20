@@ -1,18 +1,3 @@
-/**
- * Registro de métricas em memória (seção 12 do desafio: "métricas cobrindo,
- * no mínimo: transações por status, duplicatas detectadas, retries,
- * mensagens em DLQ, conflitos de lock, outbox lag e latência de
- * processamento").
- *
- * Trade-off documentado (ver ARCHITECTURE.md): isto é um registro simples
- * em memória, não Prometheus client real nem OpenTelemetry — que são
- * explicitamente opcionais no desafio. Isso significa que as métricas são
- * por instância (não agregadas entre múltiplas réplicas) e se perdem em
- * um restart. Suficiente para demonstrar os pontos de instrumentação
- * corretos, não para operar em produção multi-instância sem um agregador
- * externo (que é exatamente o que o Prometheus faria via scraping de cada
- * instância, então o formato de exposição já é compatível).
- */
 class MetricsRegistry {
   private counters = new Map<string, number>();
   private histogramSamples = new Map<string, number[]>();
@@ -27,9 +12,6 @@ class MetricsRegistry {
     const key = this.key(name, labels);
     const samples = this.histogramSamples.get(key) ?? [];
     samples.push(value);
-    // Mantém uma janela limitada para não crescer indefinidamente em
-    // processos de longa duração — não precisamos do histórico completo,
-    // só o suficiente para calcular percentis aproximados.
     if (samples.length > 1000) samples.shift();
     this.histogramSamples.set(key, samples);
   }
@@ -39,7 +21,6 @@ class MetricsRegistry {
     this.gauges.set(key, value);
   }
 
-  /** Exposição no formato de texto do Prometheus (suficiente para scraping). */
   renderPrometheusText(): string {
     const lines: string[] = [];
 
@@ -84,8 +65,6 @@ function percentile(sortedValues: number[], p: number): number {
 }
 
 export const metrics = new MetricsRegistry();
-
-// --- Helpers específicos do domínio (nomes alinhados à seção 12) ---
 
 export function recordTransactionByStatus(status: string): void {
   metrics.incrementCounter('wagering_transactions_total', { status });

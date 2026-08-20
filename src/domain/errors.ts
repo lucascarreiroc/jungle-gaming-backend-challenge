@@ -1,14 +1,3 @@
-/**
- * Taxonomia de failure codes — estável e legível por máquina.
- * O provedor usa esse código para decidir se reenvia, corrige o payload ou desiste.
- *
- * Convenção: prefixo indica a categoria.
- * VALIDATION_*  -> payload malformado, nunca deve ser reenviado sem correção.
- * BUSINESS_*    -> violação de regra de negócio, terminal (REJECTED).
- * CONFLICT_*    -> idempotência ou concorrência, o cliente decide o que fazer.
- * REFERENCE_*   -> problemas relacionados a REFUND/ROLLBACK.
- * INFRA_*       -> falha transitória, deve ser retentada.
- */
 export enum FailureCode {
   VALIDATION_INVALID_MONEY = 'VALIDATION_INVALID_MONEY',
   VALIDATION_CURRENCY_MISMATCH = 'VALIDATION_CURRENCY_MISMATCH',

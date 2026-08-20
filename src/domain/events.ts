@@ -32,7 +32,6 @@ export abstract class IntegrationEvent<T> {
     this.data = props.data;
   }
 
-  /** Envelope serializado gravado no payload da outbox. */
   toJSON(): {
     eventId: string;
     eventType: string;
@@ -65,8 +64,6 @@ function newEventId(): string {
   return randomUUID();
 }
 
-// ---- WagerTransactionProcessed ----
-
 export interface WagerTransactionProcessedData {
   transactionId: string;
   walletId: string;
@@ -93,8 +90,6 @@ export class WagerTransactionProcessed extends IntegrationEvent<WagerTransaction
   }
 }
 
-// ---- WagerTransactionRejected ----
-
 export interface WagerTransactionRejectedData {
   transactionId: string;
   walletId: string;
@@ -118,8 +113,6 @@ export class WagerTransactionRejected extends IntegrationEvent<WagerTransactionR
     });
   }
 }
-
-// ---- WalletBalanceChanged ----
 
 export interface WalletBalanceChangedData {
   walletId: string;
@@ -146,8 +139,6 @@ export class WalletBalanceChanged extends IntegrationEvent<WalletBalanceChangedD
     });
   }
 }
-
-// ---- WagerTransactionPendingReference ----
 
 export interface WagerTransactionPendingReferenceData {
   transactionId: string;

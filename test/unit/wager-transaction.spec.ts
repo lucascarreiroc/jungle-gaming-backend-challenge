@@ -111,7 +111,6 @@ describe('WagerTransaction', () => {
       kind: WagerTransactionKind.Rollback,
       referenceExternalTransactionId: 'tx-1',
     });
-    // Rolling back a BET (a debit) should credit the wallet back.
     expect(rollbackOfBet.ledgerDirectionFor(bet)).toBe(LedgerDirection.Credit);
   });
 });
