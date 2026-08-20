@@ -1,313 +1,136 @@
-# ARCHITECTURE.md — Distributed Wagering Processor
+# ARCHITECTURE.md - Distributed Wagering Processor
 
-## 1. Visão geral da solução
+## 1. Como organizei o código
 
-O sistema é modelado em três camadas:
+Separei em três camadas:
 
-- **Domain** (`src/domain`): entidades e value objects puros, sem dependência
-  de framework, ORM ou infraestrutura. `Money`, `Wallet`, `WagerTransaction`,
-  `WalletLedgerEntry`, `InboxMessage`, `OutboxMessage`.
-- **Application** (`src/application`): casos de uso e portas (interfaces) que
-  a camada de domínio usa para falar com o mundo externo, sem saber como esse
-  mundo é implementado (`ports.ts`).
-- **Infrastructure/Interfaces** (`src/infrastructure`, `src/interfaces`):
-  implementações concretas (Postgres via `pg`, controllers HTTP NestJS,
-  consumer SQS) que implementam as portas.
+- **Domain** (`src/domain`): entidades e value objects puros, sem depender de framework, ORM ou infra nenhuma. `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, `InboxMessage`, `OutboxMessage`.
+- **Application** (`src/application`): os casos de uso e as portas (interfaces) que o domínio usa pra falar com o mundo de fora, sem saber como esse mundo é implementado (`ports.ts`).
+- **Infrastructure/Interfaces** (`src/infrastructure`, `src/interfaces`): as implementações concretas, Postgres via `pg`, controllers HTTP do NestJS, o consumer SQS.
 
-Essa separação existe para permitir testar o domínio e os casos de uso
-inteiramente em memória (testes de unidade), sem subir Postgres nem
-LocalStack — e para trocar a implementação de persistência sem tocar nas
-regras de negócio.
+Fiz essa separação principalmente porque queria conseguir testar o domínio e os casos de uso inteiramente em memória (os testes de unidade), sem precisar subir Postgres nem LocalStack pra isso. De quebra, também fica mais fácil trocar a forma de persistir sem mexer em regra de negócio.
 
-## 2. Money — por que Decimal, não number
+## 2. Money - por que Decimal em vez de number
 
-`amount` nunca passa por `number`/`float`/`double` em nenhum ponto do
-pipeline: chega como string decimal na API, é convertido para `Decimal`
-(biblioteca `decimal.js`) no domínio, e é persistido como `NUMERIC(19,2)` no
-Postgres — que também não usa ponto flutuante binário internamente.
+`amount` nunca passa por `number`/`float`/`double` em lugar nenhum do fluxo: chega como string decimal na API, vira `Decimal` (uso a lib `decimal.js`) dentro do domínio, e é persistido como `NUMERIC(19,2)` no Postgres, que também não trabalha com ponto flutuante binário.
 
-A escala é fixada em exatamente 2 casas decimais na fronteira (`Money.from`),
-o que elimina qualquer ambiguidade de arredondamento: nunca fazemos "quase
-25.00", sempre é exatamente "25.00" ou a operação é rejeitada.
+A escala fica fixa em 2 casas decimais logo na entrada (`Money.from`), o que já elimina qualquer ambiguidade de arredondamento, nunca existe um "quase 25.00", ou é exatamente "25.00" ou a operação é rejeitada ali mesmo.
 
-## 3. Estratégia de concorrência
+## 3. Como resolvi concorrência
 
-A unidade de concorrência é a `walletId`, conforme exigido na seção 8 do
-desafio. A estratégia escolhida foi **optimistic locking com retry limitado**,
-não pessimistic locking (`SELECT ... FOR UPDATE`), pelos seguintes motivos:
+A unidade de concorrência é a `walletId`, como o desafio pede. Optei por **optimistic locking com retry limitado**, e não lock pessimista (`SELECT ... FOR UPDATE`). Alguns motivos:
 
-- Apostas são operações de curta duração e alta frequência — lock pessimista
-  aumentaria a contenção em wallets "quentes" (jogadores muito ativos) sem
-  necessidade, já que a maioria das tentativas não colide de fato.
-- O optimistic lock (coluna `version`, `UPDATE ... WHERE id = ? AND version = ?`)
-  é barato: falha rápido (0 linhas afetadas) e permite ao use case decidir o
-  que fazer — reler e retentar, até `MAX_OPTIMISTIC_LOCK_RETRIES = 5`.
-- Cada wallet é serializada **apenas contra si mesma** — wallets diferentes
-  processam em paralelo sem qualquer lock compartilhado entre elas, o que
-  responde diretamente ao requisito "não usar lock global compartilhado por
-  todas as wallets".
+- Apostas são operações curtas e de alta frequência, lock pessimista aumentaria a contenção em wallets "quentes" (jogador muito ativo) sem necessidade real, já que a maioria das tentativas nem chega a colidir de fato.
+- O optimistic lock (coluna `version`, `UPDATE ... WHERE id = ? AND version = ?`) é barato: falha rápido (0 linhas afetadas) e deixa o use case decidir o que fazer, reler e tentar de novo, até `MAX_OPTIMISTIC_LOCK_RETRIES = 5`.
+- Cada wallet fica serializada só contra ela mesma, wallets diferentes processam em paralelo sem nenhum lock compartilhado entre elas, que é justamente o que o desafio pede quando fala pra não usar lock global.
 
-**Trade-off assumido**: sob contenção extrema numa única wallet (muitas
-requisições simultâneas para o mesmo jogador), o retry pode esgotar as 5
-tentativas e a transação é marcada `FAILED` com `INFRA_TRANSIENT_FAILURE`,
-sinalizando ao provedor para reenviar. Isso é aceitável no domínio de apostas
-(um jogador não faz 5+ apostas simultâneas na prática), mas seria uma escolha
-diferente para, por exemplo, uma wallet corporativa recebendo milhares de
-transações por segundo — ali um lock pessimista com fila explícita seria
-mais previsível.
+**Trade-off que assumi conscientemente**: sob contenção muito extrema numa única wallet (muitas requisições ao mesmo tempo pro mesmo jogador), o retry pode esgotar as 5 tentativas e a transação vira `FAILED` com `INFRA_TRANSIENT_FAILURE`, sinalizando pro provedor reenviar. Acho isso aceitável no domínio de apostas (na prática um jogador não dispara 5+ apostas simultâneas), mas seria uma escolha diferente se fosse, por exemplo, uma wallet corporativa recebendo milhares de transações por segundo, aí um lock pessimista com fila explícita seria mais previsível.
 
-### Cenário obrigatório (seção 8)
+### O cenário obrigatório do desafio
 
-Saldo inicial 100.00, duas apostas de 80.00 simultâneas:
+Saldo inicial 100.00, duas apostas de 80.00 ao mesmo tempo:
 
-1. Ambas as requisições leem a wallet com `version = 1`, `balance = 100.00`.
-2. Ambas aplicam `wallet.debit(80.00)` em memória — ambas calculam
-   `balance = 20.00`, `version = 2` localmente (isso é seguro porque é
-   estado em memória de cada processo, não compartilhado).
-3. Ambas tentam `UPDATE wallets SET balance=20.00, version=2 WHERE id=? AND version=1`.
-4. O Postgres serializa as duas UPDATEs. A primeira a chegar afeta 1 linha e
-   grava `version=2`. A segunda, avaliada depois, não encontra mais nenhuma
-   linha com `version=1` — afeta 0 linhas.
-5. A primeira segue o caminho de sucesso (ledger, outbox, `PROCESSED`).
-6. A segunda recebe `updated: false`, re-lê a wallet (agora com `version=2`,
-   `balance=20.00`), tenta `wallet.debit(80.00)` de novo — e agora
-   `InsufficientBalanceError` é lançado porque `20.00 < 80.00`. A transação é
-   marcada `REJECTED` com `BUSINESS_INSUFFICIENT_BALANCE`.
+1. As duas requisições leem a wallet com `version = 1`, `balance = 100.00`.
+2. As duas aplicam `wallet.debit(80.00)` em memória, cada uma calcula `balance = 20.00`, `version = 2` no seu próprio processo (isso é seguro porque é estado em memória local, não compartilhado ainda).
+3. As duas tentam `UPDATE wallets SET balance=20.00, version=2 WHERE id=? AND version=1`.
+4. O Postgres serializa os dois UPDATEs. O primeiro que chegar afeta 1 linha e grava `version=2`. O segundo, avaliado depois, não acha mais nenhuma linha com `version=1` afeta 0 linhas.
+5. O primeiro segue o caminho normal de sucesso (ledger, outbox, `PROCESSED`).
+6. O segundo recebe `updated: false`, relê a wallet (agora com `version=2`, `balance=20.00`), tenta `wallet.debit(80.00)` de novo, e aí sim `InsufficientBalanceError` estoura porque `20.00 < 80.00`. Fica `REJECTED` com `BUSINESS_INSUFFICIENT_BALANCE`.
 
-Resultado: exatamente uma `PROCESSED`, uma `REJECTED`, saldo final `20.00`,
-um único lançamento de débito no ledger. Ver `test/unit/wallet.spec.ts` para
-a demonstração do comportamento do domínio isoladamente, e
-`test/concurrency/` para o plano de teste com paralelismo real (ver seção 8
-deste documento sobre o que está implementado vs. planejado).
+Resultado: uma `PROCESSED`, uma `REJECTED`, saldo final `20.00`, um único lançamento de débito no ledger. O `test/unit/wallet.spec.ts` mostra o comportamento do domínio isolado, e `test/concurrency/` prova isso com paralelismo de verdade contra Postgres.
 
 ## 4. Idempotência
 
-Fonte da verdade: `UNIQUE (provider_id, idempotency_key)` no schema
-(`wager_transactions`), não cache em memória. O fluxo:
+A fonte da verdade é o `UNIQUE (provider_id, idempotency_key)` no schema (`wager_transactions`), não um cache em memória. O fluxo:
 
-1. `SELECT` por `(provider_id, idempotency_key)` dentro da mesma transação
-   que fará o `INSERT` — se existir, comparamos `payloadHash`.
-2. Payload igual → resposta de replay (`idempotentReplay: true`), com o
-   `status` e o saldo observado *no momento original*, não recalculado.
+1. Faço `SELECT` por `(provider_id, idempotency_key)` dentro da mesma transação que vai fazer o `INSERT`, se já existir, comparo o `payloadHash`.
+2. Payload igual → devolvo uma resposta de replay (`idempotentReplay: true`), com o `status` e o saldo observados *no momento original*, não recalculados.
 3. Payload diferente → `IdempotencyConflictError` (409).
-4. Se não existir, o `INSERT` segue. Se duas requisições concorrentes com a
-   mesma key chegarem verdadeiramente ao mesmo tempo (ambas passam pelo
-   SELECT antes de qualquer INSERT committar), o Postgres serializa isso no
-   nível de `INSERT`: a segunda transação **bloqueia** até a primeira
-   committar, e então recebe um erro de `unique_violation` (SQLSTATE
-   `23505`) sobre a constraint `uq_wager_tx_idempotency`. O
-   `SubmitWagerTransactionUseCase.execute()` captura especificamente esse
-   erro (verificando `err.code === '23505'` e o nome da constraint),
-   abre uma nova transação curta, busca a linha vencedora, e devolve a
-   mesma resposta de replay que o caminho "feliz" de idempotência devolveria
-   — o chamador nunca vê essa corrida como um erro. Isso está coberto pelo
-   teste `test/concurrency/wallet-concurrency.spec.ts` ("the same bet
-   submitted 50 times in parallel").
+4. Se não existir, o `INSERT` segue normalmente. Agora, se duas requisições concorrentes com a mesma key chegarem realmente ao mesmo tempo (as duas passam pelo `SELECT` antes de qualquer `INSERT` committar), o Postgres resolve isso no nível do `INSERT`: a segunda transação **bloqueia** até a primeira committar, e aí recebe um erro `unique_violation` (SQLSTATE `23505`) na constraint `uq_wager_tx_idempotency`. Achei esse caso enquanto escrevia o teste de 50 requisições em paralelo e precisei tratar explicitamente: o `SubmitWagerTransactionUseCase.execute()` captura esse erro específico, abre uma transação nova e curta, busca a linha que venceu, e devolve a mesma resposta de replay que o caminho normal devolveria, quem chamou nunca vê essa corrida como erro. Está coberto no `test/concurrency/wallet-concurrency.spec.ts` ("the same bet submitted 50 times in parallel").
 
-`payloadHash` é um SHA-256 do JSON canônico (chaves ordenadas) do
-subconjunto de campos de negócio — nunca inclui o header `Idempotency-Key`
-em si nem metadados de transporte, conforme especificado. Ver
-`computePayloadHash` em `submit-wager-transaction.use-case.ts`.
+O `payloadHash` é um SHA-256 de um JSON canônico (chaves ordenadas) do subconjunto de campos de negócio, nunca inclui o header `Idempotency-Key` em si nem nada de transporte. Está em `computePayloadHash`, dentro de `submit-wager-transaction.use-case.ts`.
 
 ## 5. Transactional Outbox
 
-Toda mutação financeira (wallet + ledger + transação + eventos) acontece
-dentro de uma única transação SQL (`UnitOfWork.run`). Os eventos de
-integração são serializados e inseridos na tabela `outbox_messages` **na
-mesma transação**, nunca publicados diretamente no SQS durante o caso de
-uso — isso é o que garante "nunca publicar eventos antes do commit".
+Toda mutação financeira (wallet + ledger + transação + eventos) acontece dentro de uma única transação SQL (`UnitOfWork.run`). Os eventos de integração são serializados e inseridos na tabela `outbox_messages` **na mesma transação**, nunca publico direto no SQS de dentro do caso de uso, que é justamente a garantia de "nunca publicar evento antes do commit".
 
-Um worker separado (`OutboxPublisherWorker`) roda periodicamente, faz
-`SELECT ... FOR UPDATE SKIP LOCKED` para pegar um lote de mensagens
-pendentes sem colidir com outros publishers, publica cada uma no SQS, e
-marca `published_at` numa transação curta separada.
+Um worker separado (`OutboxPublisherWorker`) roda de tempos em tempos, faz `SELECT ... FOR UPDATE SKIP LOCKED` pra pegar um lote de mensagens pendentes sem esbarrar em outros publishers, publica cada uma no SQS, e marca `published_at` numa transação curta separada.
 
-**Trade-off documentado explicitamente**: o lock (`SKIP LOCKED`) é liberado
-assim que a transação de leitura do lote é confirmada — ele não fica
-segurando a linha durante a chamada de rede ao SQS (isso travaria a linha por
-todo o tempo da chamada HTTP ao broker, o que é uma prática ruim). Isso
-significa que, numa janela pequena, duas instâncias *poderiam* teoricamente
-pegar a mesma mensagem em lotes que se sobrepõem no tempo. A segurança final
-não vem da exclusividade do lock durante a publicação, e sim do **consumidor
-final fazer dedup via Inbox** — publicação duplicada é explicitamente
-aceitável pelo desafio ("uma publicação duplicada continua segura para o
-consumidor"). Achei importante deixar essa nuance explícita, porque é um erro
-comum assumir que `SKIP LOCKED` sozinho garante exclusividade fim-a-fim.
+**Um trade-off que quero deixar claro**: o lock (`SKIP LOCKED`) é liberado assim que a transação de leitura do lote termina, ele não fica segurando a linha durante a chamada de rede pro SQS (isso travaria a linha pelo tempo inteiro da chamada, o que é ruim). Isso significa que, numa janela pequena, duas instâncias *poderiam* teoricamente pegar a mesma mensagem em lotes que se sobrepõem no tempo. A segurança final não vem de o lock ser exclusivo durante toda a publicação, e sim do **consumidor final fazer dedup via Inbox**, publicação duplicada é algo que o próprio desafio já assume como aceitável. Vale deixar isso explícito porque é fácil assumir errado que `SKIP LOCKED` sozinho já garante exclusividade ponta a ponta.
 
-## 6. Inbox e consumo SQS
+## 6. Inbox e o consumo do SQS
 
-`InboxMessage` deduplicada por `(consumer_name, message_id)`, PK composta —
-dedup persistente, não em memória. O `INSERT ... ON CONFLICT DO NOTHING`
-garante que, mesmo com duas instâncias processando a mesma mensagem
-simultaneamente (SQS at-least-once), apenas uma prossegue para aplicar o
-efeito de negócio.
+`InboxMessage` é deduplicada por `(consumer_name, message_id)`, chave primária composta, dedup persistente, não em memória. O `INSERT ... ON CONFLICT DO NOTHING` garante que, mesmo com duas instâncias processando a mesma mensagem ao mesmo tempo (SQS é at-least-once), só uma segue adiante pra aplicar o efeito de negócio.
 
-O `SqsConsumer` (`src/infrastructure/sqs/sqs-consumer.ts`) está implementado
-e reutiliza o mesmo `SubmitWagerTransactionUseCase` que o controller HTTP
-usa — não existe uma segunda cópia da lógica de negócio para o caminho de
-fila. Fluxo:
+O `SqsConsumer` (`src/infrastructure/sqs/sqs-consumer.ts`) reutiliza o mesmo `SubmitWagerTransactionUseCase` que o controller HTTP usa, não existe uma segunda cópia da lógica de negócio pro caminho de fila. O fluxo:
 
 1. Faz long polling na fila via `ReceiveMessageCommand`.
-2. Para cada mensagem, checa o Inbox primeiro (leitura rápida) — se já
-   processada, faz ack imediatamente sem tocar no use case de novo.
+2. Pra cada mensagem, checa o Inbox primeiro (leitura rápida), se já foi processada, dá ack na hora sem chamar o use case de novo.
 3. Chama o use case. Três desfechos possíveis:
-   - **Sucesso** (`PROCESSED`, `REJECTED` ou `PENDING_REFERENCE`, todos
-     retornados normalmente pelo use case, sem lançar exceção) → grava no
-     Inbox como processada e faz ack. Uma rejeição de negócio é, do ponto de
-     vista do consumer, um resultado "tratado com sucesso": o use case
-     rodou até o fim e o resultado está durável no banco.
-   - **`DomainError` lançado** (ex.: conflito de idempotência com payload
-     divergente) → problema de dados, não de infraestrutura. Grava no Inbox
-     e faz ack — reentregar não vai resolver.
-   - **Qualquer outro erro** (Postgres fora do ar, timeout de rede) →
-     tratado como transitório. **Não** faz ack. A mensagem volta a ficar
-     visível após o `VisibilityTimeout` e o SQS reentrega automaticamente.
-4. Em `SIGTERM`/`SIGINT` (capturado em `main.ts`), o consumer para de puxar
-   mensagens novas e aguarda as que já estão em andamento terminarem (ack ou
-   não) antes do processo encerrar — evita matar o processo com trabalho
-   pela metade.
+   - **Sucesso** (`PROCESSED`, `REJECTED` ou `PENDING_REFERENCE`, todos devolvidos normalmente sem exceção) → grava no Inbox como processada e dá ack. Uma rejeição de negócio, pro consumer, é um resultado "tratado com sucesso": o use case rodou até o fim e o resultado ficou gravado no banco.
+   - **`DomainError` lançado** (por exemplo, conflito de idempotência com payload diferente) → é problema de dado, não de infra. Grava no Inbox e dá ack, já que reentregar não resolveria nada.
+   - **Qualquer outro erro** (Postgres fora do ar, timeout de rede) → trato como transitório. **Não** dou ack. A mensagem volta a ficar visível depois do `VisibilityTimeout` e o SQS reentrega sozinho.
+4. Em `SIGTERM`/`SIGINT` (capturado no `main.ts`), o consumer para de puxar mensagens novas e espera as que já estão em andamento terminarem (ack ou não) antes do processo encerrar de vez pra não matar o processo no meio do trabalho.
 
-**Trade-off documentado explicitamente**: a marcação do `InboxMessage` como
-processada acontece em uma transação **separada** da mutação financeira do
-use case (que já commita sua própria transação internamente antes do
-consumer sequer saber o resultado). Isso significa que, num crash exatamente
-entre o use case retornar e o Inbox ser gravado, uma redelivery reprocessaria
-a mensagem — mas isso é seguro por design: a fonte da verdade de idempotência
-é a constraint `UNIQUE(provider_id, idempotency_key)` no nível de negócio
-(seção 4), não o Inbox. O Inbox aqui é uma otimização de custo (evita chamar
-o use case inteiro de novo para uma mensagem obviamente repetida), não a
-garantia final — então essa janela não compromete a correção, só a
-eficiência marginal em um cenário raro.
+**Outro trade-off que assumi**: marcar o `InboxMessage` como processada acontece numa transação **separada** da mutação financeira do use case (que já commitou a própria transação antes mesmo do consumer saber o resultado). Isso quer dizer que, num crash bem no meio, depois do use case retornar mas antes do Inbox ser gravado, uma redelivery reprocessaria a mensagem. Mas isso é seguro por design: quem garante a idempotência de verdade é a constraint `UNIQUE(provider_id, idempotency_key)` (seção 4), não o Inbox. O Inbox aqui é só uma otimização de custo (evita chamar o use case inteiro de novo pra algo obviamente repetido), não a garantia final, então essa janela não compromete a correção, só perde um pouco de eficiência num cenário raro.
 
-**DLQ**: a política de `maxReceiveCount` que decide quando uma mensagem vai
-para a DLQ é configurada na fila em si (fora do código da aplicação — seria
-parte de um script de provisionamento de infraestrutura, não implementado
-neste scaffold). O consumer não decide "envie isso pra DLQ agora"
-explicitamente; ele só decide "faço ack (termina aqui)" ou "não faço ack
-(deixa o SQS decidir o que fazer com a redelivery)".
+**Sobre a DLQ**: quem decide quando uma mensagem vai pra DLQ é a política de `maxReceiveCount` configurada na própria fila (fora do código da aplicação isso seria parte de um script de provisionamento de infra, que não cheguei a escrever). O consumer não decide "manda isso pra DLQ agora"; ele só decide "dou ack (acabou aqui)" ou "não dou ack (deixo o SQS decidir o que fazer com a redelivery)".
 
-**Limitação conhecida**: não escrevi um teste de integração automatizado
-para o `SqsConsumer` (só validei manualmente publicando mensagens via
-`awslocal`, ver README.md) — está na lista de próximos passos.
+**Limitação que assumo**: não escrevi um teste de integração automatizado pro `SqsConsumer` em si, validei manualmente publicando mensagens via `awslocal` (ver README). A lógica de negócio que ele usa por baixo já está coberta pelos testes de concorrência, então o risco real aqui é baixo, mas o teste end-to-end da parte SQS ficou de fora.
 
-## 7. Escolha de ORM
+## 7. Por que não usei MikroORM
 
-O desafio recomenda MikroORM como preferencial. Optei por acessar o Postgres
-diretamente via `pg` (node-postgres) na camada de infraestrutura porque a
-operação mais crítica do sistema — o `UPDATE` otimista da wallet com
-`WHERE version = ?` e a checagem explícita de linhas afetadas — fica mais
-direta de escrever, ler e auditar em SQL puro do que atrás do
-`EntityManager.transactional()` e `LockMode` de um ORM.
+O desafio recomenda MikroORM como opção preferencial. Optei por acessar o Postgres direto via `pg` (node-postgres) porque a operação mais crítica do sistema, o `UPDATE` otimista da wallet com `WHERE version = ?` e a checagem explícita de quantas linhas foram afetadas, fica bem mais direta de escrever, ler e auditar em SQL puro do que atrás do `EntityManager.transactional()` e do `LockMode` de um ORM.
 
-Os repositórios implementam as mesmas portas (`WalletRepository`,
-`WagerTransactionRepository`, etc.) que o caso de uso depende — então trocar
-essa implementação por MikroORM (usando `EntityManager.transactional()` como
-`UnitOfWork` e `LockMode.OPTIMISTIC` nos `em.findOne`) é uma troca mecânica
-na camada de infraestrutura, sem tocar em domínio ou casos de uso. Se a banca
-preferir ver a versão com MikroORM, esse é o próximo passo natural.
+Os repositórios implementam as mesmas portas (`WalletRepository`, `WagerTransactionRepository`, etc.) que o caso de uso depende, então trocar isso por MikroORM depois (usando `EntityManager.transactional()` como `UnitOfWork` e `LockMode.OPTIMISTIC` nos `em.findOne`) seria uma troca mecânica só na camada de infra, sem tocar em domínio nem casos de uso.
 
 ## 8. Testes
 
-**Unidade** (`test/unit/`): `Money` (escala, arredondamento, entradas
-inválidas, ausência de drift de float), `Wallet` (todas as invariantes de
-saldo, incluindo o cenário obrigatório da seção 8 testado single-threaded),
-transições de estado de `WagerTransaction`.
+**Unidade** (`test/unit/`): `Money` (escala, arredondamento, entradas inválidas, ausência de drift de float), `Wallet` (todas as invariantes de saldo, incluindo o cenário obrigatório testado single-threaded), e as transições de estado de `WagerTransaction`.
 
-**Concorrência** (`test/concurrency/`), rodando contra Postgres real via
-`docker-compose`, com paralelismo genuíno (`Promise.all`), não mocks:
-- o cenário obrigatório da seção 8 (duas apostas de 80.00 contra saldo de
-  100.00 → uma `PROCESSED`, uma `REJECTED`, saldo final 20.00, um único
-  lançamento de débito);
-- a mesma aposta enviada 50 vezes em paralelo (idempotência sob concorrência
-  real, incluindo a corrida de `unique_violation` descrita na seção 4);
-- wallets distintas processando em paralelo sem bloqueio cruzado;
-- três instâncias simultâneas disputando a mesma wallet.
+**Concorrência** (`test/concurrency/`), contra Postgres real via docker-compose, com paralelismo genuíno (`Promise.all`), sem mock nenhum:
+- o cenário obrigatório (duas apostas de 80.00 contra saldo de 100.00 → uma `PROCESSED`, uma `REJECTED`, saldo final 20.00, um único débito);
+- a mesma aposta enviada 50 vezes em paralelo (a corrida de `unique_violation` que expliquei na seção 4);
+- wallets diferentes processando em paralelo sem se bloquearem;
+- três instâncias disputando a mesma wallet ao mesmo tempo.
 
 **Integração** (`test/integration/`), também contra Postgres real:
-- **constraints do schema**: tenta inserir saldo negativo, wallet duplicada
-  (mesmo playerId+currency) e lançamento de ledger desbalanceado diretamente
-  via SQL, confirmando que o banco rejeita — não apenas o código de
-  aplicação;
-- **atomicidade**: uma BET bem-sucedida atualiza wallet, cria lançamento no
-  ledger e enfileira os eventos corretos na outbox, tudo na mesma transação;
-- **OutboxPublisherWorker**: publica mensagens pendentes com sucesso; lida
-  com falha de publicação agendando retry com backoff sem perder a
-  mensagem; duas instâncias do worker rodando ao mesmo tempo nunca publicam
-  a mesma mensagem duas vezes (`SKIP LOCKED`);
-- **referências fora de ordem** (seção 7.1): um REFUND que chega antes da
-  BET fica `PENDING_REFERENCE`, e é resolvido corretamente quando o
-  `PendingReferenceWorker` roda depois que a BET existe; uma referência que
-  nunca aparece é rejeitada com `REFERENCE_NOT_FOUND_TIMEOUT` após esgotar
-  `MAX_REFERENCE_WAIT_ATTEMPTS`;
-- **reconciliação**: saldo materializado bate com o saldo recalculado do
-  ledger após uma sequência de operações mistas (BET, BET, WIN).
+- **constraints do schema**: tento inserir saldo negativo, wallet duplicada (mesmo playerId+currency) e lançamento de ledger desbalanceado direto via SQL, pra confirmar que é o banco que rejeita, não só o código;
+- **atomicidade**: uma BET bem-sucedida atualiza a wallet, cria o lançamento no ledger e enfileira os eventos certos na outbox, tudo na mesma transação;
+- **OutboxPublisherWorker**: publica mensagens pendentes com sucesso; lida com falha de publicação agendando retry com backoff sem perder a mensagem; duas instâncias do worker rodando juntas nunca publicam a mesma mensagem duas vezes;
+- **referências fora de ordem**: um REFUND que chega antes da BET fica `PENDING_REFERENCE` e é resolvido certo quando o `PendingReferenceWorker` roda depois que a BET existe; uma referência que nunca aparece é rejeitada com `REFERENCE_NOT_FOUND_TIMEOUT` depois de esgotar as tentativas;
+- **reconciliação**: saldo materializado bate com o saldo recalculado do ledger depois de uma sequência de operações misturadas.
 
-**Decisão de design nos testes de outbox**: usamos um `FakeEventPublisher`
-in-memory em vez de LocalStack real nesses testes específicos. O que está
-sendo validado ali é o mecanismo de *locking e retry do worker sobre o
-Postgres* (a parte não-trivial), não a integração de rede com o SQS em si —
-essa já foi validada manualmente end-to-end com LocalStack real (ver
-README, seção "Testando o SqsConsumer") e usa a mesma classe
-`SqsEventPublisher` que seria usada em produção. Isso mantém os testes
-rápidos e determinísticos sem duplicar cobertura.
+Nesses testes de outbox, usei um `FakeEventPublisher` in-memory em vez de LocalStack de verdade. O que estava testando ali era o mecanismo de lock e retry do worker sobre o Postgres (a parte não trivial), não a integração de rede com o SQS em si, isso eu já validei manualmente, ponta a ponta, com LocalStack real (ver README, "Testando o consumer de entrada"), e uso a mesma classe `SqsEventPublisher` que rodaria de verdade. Isso deixou os testes rápidos e determinísticos sem duplicar cobertura.
 
-**Não implementado**: teste de integração automatizado dedicado ao
-`SqsConsumer` de entrada (a lógica de dedup/idempotência que ele reutiliza,
-porém, já está coberta pelos testes de concorrência, já que é o mesmo
-`SubmitWagerTransactionUseCase`); teste de carga (`bun run test:load`) —
-ambos são itens menores frente ao que já está coberto, e o teste de carga é
-diferencial opcional, não requisito.
+O que ficou de fora: um teste de integração automatizado dedicado pro `SqsConsumer` de entrada (a lógica de negócio que ele usa já está coberta pelos testes de concorrência, já que é o mesmo use case), e o teste de carga (`bun run test:load`), que é diferencial e não obrigatório.
 
 ## 9. Autenticação
 
-Não implementada. Seguindo a opção explícita do desafio de documentar a
-decisão em vez de implementar: o ponto de extensão seria um `AuthGuard`
-no-op no NestJS, substituível por um guard real de validação de JWT emitido
-por um IdP (Keycloak/Zitadel) via OIDC, sem tabela própria de usuários.
+Não implementei. O desafio deixa explícito que isso é uma opção válida, desde que documentada: o ponto de extensão seria um `AuthGuard` no-op no NestJS, que depois seria trocado por um guard real validando JWT emitido por um IdP (Keycloak ou Zitadel) via OIDC, sem tabela própria de usuários.
 
 ## 10. Observabilidade
 
-Logs estruturados em JSON (`src/infrastructure/observability/logger.ts`),
-emitidos para stdout, com campos padronizados (`correlationId`,
-`transactionId`, `walletId`, `providerId`, `messageId` quando aplicável).
-Métricas em memória (`src/infrastructure/observability/metrics.ts`),
-expostas em `GET /metrics` no formato de texto do Prometheus:
+Logs estruturados em JSON (`src/infrastructure/observability/logger.ts`), pro stdout, com campos padronizados (`correlationId`, `transactionId`, `walletId`, `providerId`, `messageId` quando fizer sentido). Métricas em memória (`src/infrastructure/observability/metrics.ts`), expostas em `GET /metrics` no formato de texto do Prometheus:
 
-- `wagering_transactions_total{status}` — transações por status;
-- `wagering_idempotent_duplicates_total` — replays de idempotência detectados;
-- `wagering_optimistic_lock_conflicts_total` — conflitos de `version` na wallet;
-- `wagering_outbox_retries_total` e `wagering_outbox_lag_ms` — saúde do publisher;
-- `wagering_sqs_redeliveries_total` — mensagens SQS não confirmadas (erro transitório);
-- `wagering_dlq_messages` — profundidade da DLQ, via polling periódico de
-  `GetQueueAttributes` (não é o app decidindo mover para DLQ — isso é a
-  redrive policy da própria fila; o app só observa).
-- `wagering_processing_latency_ms` — latência de `execute()` do use case (p50/p95/p99 aproximados).
+- `wagering_transactions_total{status}` - transações por status;
+- `wagering_idempotent_duplicates_total` - quantos replays de idempotência peguei;
+- `wagering_optimistic_lock_conflicts_total` - conflitos de `version` na wallet;
+- `wagering_outbox_retries_total` e `wagering_outbox_lag_ms` - saúde do publisher;
+- `wagering_sqs_redeliveries_total` - mensagens SQS não confirmadas (erro transitório);
+- `wagering_dlq_messages` - profundidade da DLQ, via polling periódico de `GetQueueAttributes` (o app só observa, quem decide mover pra DLQ é a redrive policy da própria fila);
+- `wagering_processing_latency_ms` - latência do `execute()` do use case (p50/p95/p99 aproximados).
 
-**Trade-off documentado**: é um registro em memória por instância, não
-Prometheus client real nem OpenTelemetry (explicitamente opcionais no
-desafio). Métricas não são agregadas entre múltiplas réplicas nem
-sobrevivem a um restart — um operador real faria scraping periódico de
-`/metrics` em cada instância e agregaria externamente (Prometheus faz
-exatamente isso, então o formato de exposição já é compatível).
+É um registro em memória por instância, não um Prometheus client de verdade nem OpenTelemetry, ambos explicitamente opcionais no desafio. Isso quer dizer que as métricas não se agregam entre réplicas e se perdem num restart. Num cenário real, um operador faria scraping periódico do `/metrics` em cada instância e agregaria isso externamente, que é exatamente o que o Prometheus faz, então o formato de exposição já é compatível com isso.
 
-Health checks (`/health/live`, `/health/ready`) não exigem autenticação,
-conforme a seção 2 do desafio.
+Os health checks (`/health/live`, `/health/ready`) não exigem autenticação, como o desafio pede.
 
-## 11. Limitações conhecidas (resumo)
+## 11. Resumo do que ficou faltando
 
-1. `SqsConsumer` de entrada validado manualmente (ver README), sem teste
-   automatizado dedicado — a lógica de negócio que ele reutiliza está
-   coberta pelos testes de concorrência.
-2. Provisionamento das filas SQS no LocalStack é manual (`awslocal`,
-   documentado no README), não automatizado no `docker-compose.yml`.
-3. Autenticação não implementada (decisão documentada na seção 9, permitida
-   explicitamente pelo desafio).
-4. Métricas em memória, não Prometheus/OpenTelemetry reais (seção 10) —
-   ambos explicitamente opcionais no desafio.
-5. Teste de carga (`bun run test:load`) não implementado — diferencial
-   opcional, não requisito.
+1. Teste de integração automatizado dedicado pro `SqsConsumer` de entrada, validei manualmente (ver README), e a lógica de negócio por trás já está coberta pelos testes de concorrência.
+2. Criar as filas SQS no LocalStack é manual hoje (comando `awslocal`, documentado no README), não está automatizado no `docker-compose.yml`.
+3. Autenticação não implementada, decisão documentada na seção 9, que o próprio desafio permite.
+4. Métricas em memória, não Prometheus/OpenTelemetry de verdade (seção 10), os dois são opcionais no desafio.
+5. Teste de carga (`bun run test:load`) não implementado, é diferencial, não requisito.
 
-Nenhuma dessas limitações afeta as garantias centrais avaliadas pelo
-desafio (correção financeira, concorrência, idempotência, atomicidade da
-outbox) — todas essas estão implementadas e cobertas por teste automatizado
-rodando contra Postgres real.
+Nada disso mexe nas garantias centrais que o desafio avalia (correção financeira, concorrência, idempotência, atomicidade da outbox), essas estão todas implementadas e cobertas por teste automatizado, rodando contra Postgres real.
